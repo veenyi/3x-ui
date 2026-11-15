@@ -109,6 +109,16 @@ REALITY_DEFAULT_TARGET = "www.sony.com:443"   # same site as the first node, so
                                               # profile to an observer
 
 
+def detect_public_ip():
+    for probe in ("https://api.ipify.org", "https://ifconfig.me/ip"):
+        try:
+            import urllib.request as u
+            return u.urlopen(u.Request(probe), timeout=10).read().decode().strip()
+        except Exception:
+            continue
+    return ""
+
+
 def gen_reality_keys():
     """Use the panel's own core binary rather than inventing a keypair format."""
     import binascii
@@ -126,10 +136,14 @@ def gen_reality_keys():
     return priv, pub, ids
 
 
+def port_of(target):
+    return target.rsplit(":", 1)[1] if ":" in target else "443"
+
+
 def reality_inbound_payload(port, remark, priv, pub, target, email, uuid, sub_id):
     host = target.split(":")[0]
     client = {
-        "id": uuid, "email": email, "flow": "xtls-rsv1", "enable": True,
+        "id": uuid, "email": email, "flow": "xtls-rprx-vision", "enable": True,
         "expiryTime": 0, "totalGB": 0, "limitIp": 0, "reset": 0,
         "subId": sub_id, "comment": "quickstart",
     }
@@ -141,8 +155,11 @@ def reality_inbound_payload(port, remark, priv, pub, target, email, uuid, sub_id
             "network": "tcp", "security": "reality",
             "realitySettings": {
                 "show": False, "fingerprint": "chrome",
-                "serverNames": [host], "target": host,
-                "ports": "443", "privateKey": priv, "shortIds": ids_of(priv),
+                # Xray parses target as host:port. Storing the bare host with
+                # ports in a sibling field makes the core refuse to start with
+                # `please fill in a valid value for "target"` and crash-loop.
+                "serverNames": [host], "target": target,
+                "ports": port_of(target), "privateKey": priv, "shortIds": ids_of(priv),
                 "maxClientVer": "", "minClientVer": "", "maxTimediff": 0, "xver": 0,
                 "mldsa65Seed": "",
                 "settings": {"publicKey": pub, "fingerprint": "chrome",
@@ -366,7 +383,7 @@ def main():
     # the guard file alone does nothing; it needs its systemd unit
     if os.path.exists("/etc/x-ui/lgl-guard.nft") and not os.path.exists(
             "/etc/systemd/system/xui-lgl-guard.service"):
-        ip = os.environ.get("XQS_PUBLIC_IP", "")
+        ip = os.environ.get("XQS_PUBLIC_IP", "") or detect_public_ip()
 
         def install_guard():
             unit = "\n".join([
@@ -385,13 +402,15 @@ def main():
             subprocess.run(["systemctl", "daemon-reload"], check=False)
             subprocess.run(["systemctl", "enable", "--now", "xui-lgl-guard"], check=False)
         if ip:
-            # templated so the allowlist names this box, not the first one
+            # The repo ships a placeholder, not an address: substituting a
+            # hardcoded first-node IP here left the token in the file on every
+            # other node, and nft refuses to load a ruleset with a bare word
+            # where an address should be.
             with open("/etc/x-ui/lgl-guard.nft") as f:
                 body = f.read()
-            if "23.147.68.103" in body:
-                body = body.replace("23.147.68.103", ip)
-                with open("/etc/x-ui/lgl-guard.nft", "w") as f:
-                    f.write(body)
+            body = body.replace("XQS_PUBLIC_IP", ip).replace("23.147.68.103", ip)
+            with open("/etc/x-ui/lgl-guard.nft", "w") as f:
+                f.write(body)
         R.write("enable looking-glass guard", install_guard)
 
     cron = subprocess.run(["crontab", "-l"], capture_output=True, text=True).stdout
