@@ -80,85 +80,17 @@ acme_listen_flag() {
 is_port_in_use() {
     local port="$1"
     if command -v ss > /dev/null 2>&1; then
-        ss -ltn 2> /dev/null | awk -v p=":${port}$" '$4 ~ p {found = 1} END {exit !found}'
+        ss -ltn 2> /dev/null | awk -v p=":${port}$" '$4 ~ p {exit 0} END {exit 1}'
         return
     fi
     if command -v netstat > /dev/null 2>&1; then
-        netstat -lnt 2> /dev/null | awk -v p=":${port}$" '$4 ~ p {found = 1} END {exit !found}'
+        netstat -lnt 2> /dev/null | awk -v p=":${port} " '$4 ~ p {exit 0} END {exit 1}'
         return
     fi
     if command -v lsof > /dev/null 2>&1; then
         lsof -nP -iTCP:${port} -sTCP:LISTEN > /dev/null 2>&1 && return 0
     fi
     return 1
-}
-
-normalize_panel_port() {
-    local port="$1"
-    [[ "$port" =~ ^[0-9]+$ ]] || return 1
-    # Strip leading zeros before bounding the length and doing arithmetic:
-    # Bash and the Go flag parser otherwise interpret leading zeros as octal.
-    port="${port#"${port%%[!0]*}"}"
-    [[ -n "$port" && ${#port} -le 5 ]] || return 1
-    ((10#$port <= 65535)) || return 1
-    printf '%s\n' "$port"
-}
-
-# Print only the selected decimal port to stdout; prompts/notices use stderr.
-select_panel_port() {
-    local confirm=n port attempt
-    if [[ "$NONINTERACTIVE" == 1 ]]; then
-        [[ -z "${XUI_PANEL_PORT+x}" ]] || confirm=y
-    else
-        while true; do
-            if ! IFS= read -rp "Would you like to customize the Panel Port settings? (If not, a random port will be applied) [y/N]: " confirm; then
-                echo 'Cannot read the panel port confirmation; aborting.' >&2
-                return 1
-            fi
-            confirm="${confirm#"${confirm%%[![:space:]]*}"}"
-            confirm="${confirm%"${confirm##*[![:space:]]}"}"
-            case "${confirm,,}" in
-                y | yes) break ;;
-                n | no | '') confirm=n; break ;;
-                *) echo 'Please answer yes or no (Enter defaults to No).' >&2 ;;
-            esac
-        done
-    fi
-
-    if [[ "$confirm" == n ]]; then
-        for ((attempt = 0; attempt < 100; attempt++)); do
-            if ! port=$(shuf -i 1024-62000 -n 1); then
-                echo 'Failed to generate a random panel port.' >&2
-                return 1
-            fi
-            if port=$(normalize_panel_port "$port") && ! is_port_in_use "$port"; then
-                echo "Generated random port: $port" >&2
-                printf '%s\n' "$port"
-                return 0
-            fi
-        done
-        echo 'Could not find an available random panel port; aborting.' >&2
-        return 1
-    fi
-
-    while true; do
-        if [[ "$NONINTERACTIVE" == 1 ]]; then
-            port="$XUI_PANEL_PORT"
-        elif ! read -rp 'Please set up the panel port: ' port; then
-            echo 'Cannot read the custom panel port; aborting.' >&2
-            return 1
-        fi
-        if ! port=$(normalize_panel_port "$port"); then
-            echo 'Invalid port. Enter a number between 1 and 65535.' >&2
-        elif is_port_in_use "$port"; then
-            echo "Port $port is already in use. Choose another panel port." >&2
-        else
-            echo "Your Panel Port is: $port" >&2
-            printf '%s\n' "$port"
-            return 0
-        fi
-        [[ "$NONINTERACTIVE" != 1 ]] || return 1
-    done
 }
 
 install_base() {
@@ -1146,23 +1078,9 @@ prompt_and_setup_ssl() {
 }
 
 config_after_install() {
-    local settings existing_webBasePath
-    if ! settings=$("${xui_folder}/x-ui" setting -show true) ||
-        ! existing_webBasePath=$(printf '%s\n' "$settings" | awk '
-            /^get .* failed, error info:/ { failed = 1 }
-            /^hasDefaultCredential: (true|false)$/ { credentials++ }
-            /^port: [0-9]+$/ { ports++ }
-            /^webBasePath:/ { paths++; sub(/^webBasePath: ?/, ""); path = $0 }
-            END {
-                if (failed || credentials != 1 || ports != 1 || paths != 1 || (path != "" && path !~ /^\//)) exit 1
-                print path
-            }'); then
-        echo -e "${red}Unable to read webBasePath; leaving existing settings unchanged.${plain}" >&2
-        return 1
-    fi
-    existing_webBasePath=${existing_webBasePath#/}
-    local existing_hasDefaultCredential=$(printf '%s\n' "$settings" | awk '/^hasDefaultCredential: / {print $2}')
-    local existing_port=$(printf '%s\n' "$settings" | awk '/^port: / {print $2}')
+    local existing_hasDefaultCredential=$(${xui_folder}/x-ui setting -show true | grep -Eo 'hasDefaultCredential: .+' | awk '{print $2}')
+    local existing_webBasePath=$(${xui_folder}/x-ui setting -show true | grep -Eo 'webBasePath: .+' | awk '{print $2}' | sed 's#^/##')
+    local existing_port=$(${xui_folder}/x-ui setting -show true | grep -Eo 'port: .+' | awk '{print $2}')
     # Properly detect empty cert by checking if cert: line exists and has content after it
     local existing_cert=$(${xui_folder}/x-ui setting -getCert true | grep 'cert:' | awk -F': ' '{print $2}' | tr -d '[:space:]')
     local URL_lists=(
@@ -1202,7 +1120,7 @@ config_after_install() {
         fi
     fi
 
-    if [[ -z "$existing_webBasePath" ]]; then
+    if [[ ${#existing_webBasePath} -lt 4 ]]; then
         if [[ "$existing_hasDefaultCredential" == "true" ]]; then
             local config_webBasePath="${XUI_WEB_BASE_PATH:-$(gen_random_string 18)}"
             local config_username="${XUI_USERNAME:-$(gen_random_string 10)}"
@@ -1337,20 +1255,26 @@ EOF
                 fi
             fi
 
-            config_port=$(select_panel_port) || exit 1
-
-            local settings_output settings_status=0
-            settings_output=$("${xui_folder}/x-ui" setting -username "${config_username}" -password "${config_password}" -port "${config_port}" -webBasePath "${config_webBasePath}" 2>&1) || settings_status=$?
-            printf '%s\n' "$settings_output"
-            # Released CLIs may print a settings/database error and still exit 0.
-            # Require all three existing success messages before claiming success.
-            if [[ "$settings_status" != 0 ]] ||
-                ! grep -Fxq "Port set successfully: ${config_port}" <<< "$settings_output" ||
-                ! grep -Fxq 'Username and password updated successfully' <<< "$settings_output" ||
-                ! grep -Fxq 'Base URI path set successfully' <<< "$settings_output"; then
-                echo 'Failed to configure panel settings; installation aborted.' >&2
-                exit 1
+            if [[ "$NONINTERACTIVE" == "1" ]]; then
+                if [[ -n "${XUI_PANEL_PORT:-}" ]]; then
+                    config_port="${XUI_PANEL_PORT}"
+                    echo -e "${yellow}Your Panel Port is: ${config_port}${plain}"
+                else
+                    config_port=$(shuf -i 1024-62000 -n 1)
+                    echo -e "${yellow}Generated random port: ${config_port}${plain}"
+                fi
+            else
+                read -rp "Would you like to customize the Panel Port settings? (If not, a random port will be applied) [y/n]: " config_confirm
+                if [[ "${config_confirm}" == "y" || "${config_confirm}" == "Y" ]]; then
+                    read -rp "Please set up the panel port: " config_port
+                    echo -e "${yellow}Your Panel Port is: ${config_port}${plain}"
+                else
+                    config_port=$(shuf -i 1024-62000 -n 1)
+                    echo -e "${yellow}Generated random port: ${config_port}${plain}"
+                fi
             fi
+
+            ${xui_folder}/x-ui setting -username "${config_username}" -password "${config_password}" -port "${config_port}" -webBasePath "${config_webBasePath}"
 
             echo ""
             echo -e "${green}═══════════════════════════════════════════${plain}"
@@ -1424,7 +1348,7 @@ EOF
                 "${config_webBasePath}" "${SSL_SCHEME}" "${SSL_HOST}" "${config_apiToken}" "${db_type_out}"
         else
             local config_webBasePath=$(gen_random_string 18)
-            echo -e "${yellow}WebBasePath is missing or set to root. Generating a new one...${plain}"
+            echo -e "${yellow}WebBasePath is missing or too short. Generating a new one...${plain}"
             ${xui_folder}/x-ui setting -webBasePath "${config_webBasePath}"
             echo -e "${green}New WebBasePath: ${config_webBasePath}${plain}"
 
@@ -1728,13 +1652,13 @@ _install_xui_service_unit() {
 # fails with "Failed to fetch x-ui version"), and falls back to the API.
 resolve_latest_tag() {
     local url tag
-    url=$(curl -sSLI -o /dev/null -w '%{url_effective}' --retry 5 --retry-delay 3 --connect-timeout 15 --max-time 60 "https://github.com/MHSanaei/3x-ui/releases/latest" 2>/dev/null)
+    url=$(curl -sSLI -o /dev/null -w '%{url_effective}' --retry 5 --retry-delay 3 --connect-timeout 15 --max-time 60 "https://github.com/veenyi/3x-ui/releases/latest" 2>/dev/null)
     tag=${url##*/tag/}
     if [[ "$tag" != "$url" && -n "$tag" && "$tag" != "latest" ]]; then
         echo "$tag"
         return 0
     fi
-    curl -Ls --retry 5 --retry-delay 3 --connect-timeout 15 --max-time 60 "https://api.github.com/repos/MHSanaei/3x-ui/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/'
+    curl -Ls --retry 5 --retry-delay 3 --connect-timeout 15 --max-time 60 "https://api.github.com/repos/veenyi/3x-ui/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/'
 }
 
 # Releases publish <asset>.sha256 next to each archive. A mismatch or a failed
@@ -1773,7 +1697,7 @@ require_repo_files() {
     shift
     [[ "${ref}" == "main" ]] && return 0
     for name in "$@"; do
-        status=$(curl -sIL --retry 3 --connect-timeout 15 -o /dev/null -w '%{http_code}' "https://raw.githubusercontent.com/MHSanaei/3x-ui/${ref}/${name}")
+        status=$(curl -sIL --retry 3 --connect-timeout 15 -o /dev/null -w '%{http_code}' "https://raw.githubusercontent.com/veenyi/3x-ui/${ref}/${name}")
         if [[ "${status}" != "200" ]]; then
             echo -e "${red}${name} is not available for ${ref} (HTTP ${status})${plain}"
             echo -e "${red}Install a release that ships it, or 'dev' for the rolling build. Your existing installation has not been touched.${plain}"
@@ -1793,7 +1717,7 @@ install_x-ui() {
             exit 1
         fi
         echo -e "Got x-ui latest version: ${tag_version}, beginning the installation..."
-        curl -fLR --retry 5 --retry-delay 3 --connect-timeout 15 --speed-limit 1 --speed-time 300 -o ${xui_folder}-linux-$(arch).tar.gz https://github.com/MHSanaei/3x-ui/releases/download/${tag_version}/x-ui-linux-$(arch).tar.gz
+        curl -fLR --retry 5 --retry-delay 3 --connect-timeout 15 --speed-limit 1 --speed-time 300 -o ${xui_folder}-linux-$(arch).tar.gz https://github.com/veenyi/3x-ui/releases/download/${tag_version}/x-ui-linux-$(arch).tar.gz
         if [[ $? -ne 0 ]]; then
             echo -e "${red}Downloading x-ui failed, please be sure that your server can access GitHub ${plain}"
             exit 1
@@ -1803,7 +1727,7 @@ install_x-ui() {
             echo -e "${red}Downloaded x-ui release archive is empty${plain}"
             exit 1
         fi
-        verify_release_checksum "https://github.com/MHSanaei/3x-ui/releases/download/${tag_version}/x-ui-linux-$(arch).tar.gz" "${xui_folder}-linux-$(arch).tar.gz"
+        verify_release_checksum "https://github.com/veenyi/3x-ui/releases/download/${tag_version}/x-ui-linux-$(arch).tar.gz" "${xui_folder}-linux-$(arch).tar.gz"
     else
         tag_version=$1
         # The rolling dev channel ships under a fixed, non-semver tag that is
@@ -1822,7 +1746,7 @@ install_x-ui() {
             fi
         fi
 
-        url="https://github.com/MHSanaei/3x-ui/releases/download/${tag_version}/x-ui-linux-$(arch).tar.gz"
+        url="https://github.com/veenyi/3x-ui/releases/download/${tag_version}/x-ui-linux-$(arch).tar.gz"
         echo -e "Beginning to install x-ui ${tag_version}"
         curl -fLR --retry 5 --retry-delay 3 --connect-timeout 15 --speed-limit 1 --speed-time 300 -o ${xui_folder}-linux-$(arch).tar.gz ${url}
         if [[ $? -ne 0 ]]; then
@@ -1849,7 +1773,7 @@ install_x-ui() {
     require_repo_files "${script_ref}" "${required_files[@]}"
     local xui_script_temp="/usr/bin/x-ui-temp.$$"
     rm -f "${xui_script_temp}"
-    curl -fLRo "${xui_script_temp}" "https://raw.githubusercontent.com/MHSanaei/3x-ui/${script_ref}/x-ui.sh"
+    curl -fLRo "${xui_script_temp}" "https://raw.githubusercontent.com/veenyi/3x-ui/${script_ref}/x-ui.sh"
     if [[ $? -ne 0 ]]; then
         rm -f "${xui_script_temp}"
         echo -e "${red}Failed to download x-ui.sh${plain}"
@@ -2004,7 +1928,7 @@ install_x-ui() {
     if [[ $release == "alpine" ]]; then
         xui_rc_temp="/etc/init.d/x-ui.tmp.$$"
         rm -f "${xui_rc_temp}"
-        curl -fLRo "${xui_rc_temp}" "https://raw.githubusercontent.com/MHSanaei/3x-ui/${script_ref}/x-ui.rc"
+        curl -fLRo "${xui_rc_temp}" "https://raw.githubusercontent.com/veenyi/3x-ui/${script_ref}/x-ui.rc"
         if [[ $? -ne 0 ]]; then
             rm -f "${xui_rc_temp}"
             echo -e "${red}Failed to download x-ui.rc${plain}"
@@ -2069,13 +1993,13 @@ install_x-ui() {
             echo -e "${yellow}Service files not found in tar.gz, downloading from GitHub...${plain}"
             case "${release}" in
                 ubuntu | debian | armbian)
-                    service_unit_url="https://raw.githubusercontent.com/MHSanaei/3x-ui/${script_ref}/x-ui.service.debian"
+                    service_unit_url="https://raw.githubusercontent.com/veenyi/3x-ui/${script_ref}/x-ui.service.debian"
                     ;;
                 arch | manjaro | parch)
-                    service_unit_url="https://raw.githubusercontent.com/MHSanaei/3x-ui/${script_ref}/x-ui.service.arch"
+                    service_unit_url="https://raw.githubusercontent.com/veenyi/3x-ui/${script_ref}/x-ui.service.arch"
                     ;;
                 *)
-                    service_unit_url="https://raw.githubusercontent.com/MHSanaei/3x-ui/${script_ref}/x-ui.service.rhel"
+                    service_unit_url="https://raw.githubusercontent.com/veenyi/3x-ui/${script_ref}/x-ui.service.rhel"
                     ;;
             esac
 
