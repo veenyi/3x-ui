@@ -118,15 +118,23 @@ func cachedSponsorsUpstream() (*SponsorList, error) {
 }
 
 // GetSponsorLogo returns the image bytes for a logo of a currently active sponsor.
+// GetSponsorLogo serves nothing: with placements disabled there is no
+// sponsor image to show, and answering would still cost an outbound fetch.
 func (s *PanelService) GetSponsorLogo(name string) ([]byte, string, error) {
+	return nil, "", ErrSponsorLogoUnknown
+}
+
+// getSponsorLogoUpstream keeps the original implementation reachable.
+func (s *PanelService) getSponsorLogoUpstream(name string) ([]byte, string, error) {
 	// Validated here, not only via list membership, so name can never carry a path or URL.
 	if !sponsorLogoRe.MatchString(name) {
 		return nil, "", ErrSponsorLogoUnknown
 	}
-	sponsors, err := s.GetSponsors()
+	raw, err := cachedSponsorsUpstream()
 	if err != nil {
 		return nil, "", err
 	}
+	sponsors := activeSponsors(raw, sponsorNow())
 	if !slices.ContainsFunc(sponsors.Sponsors, func(sp Sponsor) bool { return sp.Logo == sponsorLogoPath+name }) {
 		return nil, "", ErrSponsorLogoUnknown
 	}
