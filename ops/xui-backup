@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# xui-backup — consistent snapshot of the panel database plus the config that
+# is not in it. Runs from cron.
+set -uo pipefail
+
+DEST=/root/xui-backups
+KEEP=14
+DB=/etc/x-ui/x-ui.db
+LOG=/var/log/xui-backup.log
+TS=$(date +%Y%m%d-%H%M%S)
+STAGE="$DEST/$TS"
+
+mkdir -p "$DEST" "$STAGE"
+note() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$1" >> "$LOG"; }
+
+# cp on a live SQLite file with WAL enabled captures a torn image; the backup
+# API is the only way to get a consistent copy while the panel is running.
+python3 - <<PYEOF
+import sqlite3, os
+src = sqlite3.connect("$DB")
+dst = sqlite3.connect("$STAGE.tmp.db")
+with dst:
+    src.backup(dst)
+dst.close(); src.close()
+os.replace("$STAGE.tmp.db", "$STAGE/x-ui.db")
+PYEOF
+
+python3 - <<PYEOF
+import json, sqlite3, os
+c = sqlite3.connect("$STAGE/x-ui.db")
+c.row_factory = sqlite3.Row
+out = {t: [dict(r) for r in c.execute("select * from %s" % t)]
+       for t in ("settings", "inbounds", "clients", "client_inbounds", "api_tokens")}
+json.dump(out, open("$STAGE/export.json", "w"), indent=1, default=str)
+print("rows:", {k: len(v) for k, v in out.items()})
+PYEOF
+
+# Things cron cannot restore: the systemd drop-ins and the acme.sh deploy target.
+mkdir -p "$STAGE/systemd"
+cp -a /etc/systemd/system/x-ui.service "$STAGE/systemd/" 2>/dev/null || true
+cp -a /etc/systemd/system/x-ui.service.d "$STAGE/systemd/dropins" 2>/dev/null || true
+cp -a /etc/cron.d "$STAGE/cron.d" 2>/dev/null || true
+crontab -l > "$STAGE/crontab.txt" 2>/dev/null || true
+
+# A backup that will not open is not a backup.
+if ! python3 -c "
+import sqlite3
+c=sqlite3.connect('$STAGE/x-ui.db')
+n=list(c.execute('select count(*) from settings'))[0][0]
+assert n>0, 'empty settings table'
+print('verified, settings rows:', n)
+"; then
+  note "ERROR backup $TS failed verification"
+  rm -rf "$STAGE"
+  exit 1
+fi
+
+tar -czf "$DEST/x-ui-backup-$TS.tar.gz" -C "$DEST" "$TS" && rm -rf "$STAGE"
+note "ok $DEST/x-ui-backup-$TS.tar.gz ($(du -h "$DEST/x-ui-backup-$TS.tar.gz" | cut -f1))"
+
+# rotate
+ls -1t "$DEST"/x-ui-backup-*.tar.gz 2>/dev/null | tail -n +$((KEEP+1)) | while read -r f; do
+  rm -f "$f" && note "rotated out $f"
+done
+exit 0
