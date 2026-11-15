@@ -187,14 +187,38 @@ func (s *SubClashService) getClash(subId string, host string, legacy bool) (stri
 	}
 	proxyNames = append(proxyNames, "DIRECT")
 
+	// FORK: when a client is reachable on more than one port, publish a
+	// url-test group so the subscription fails over by itself. PROXY stays
+	// `select` so manual pinning keeps working; it only gains LIVE as its
+	// first member. sing-box clients get this from upstream sub_balancers.
+	liveNames := make([]string, 0, len(proxyNames))
+	for _, n := range proxyNames {
+		if n != "DIRECT" {
+			liveNames = append(liveNames, n)
+		}
+	}
+	proxyGroups := []map[string]any{{
+		"name":    "PROXY",
+		"type":    "select",
+		"proxies": proxyNames,
+	}}
+	if len(liveNames) > 1 {
+		proxyGroups = append([]map[string]any{{
+			"name":      "LIVE",
+			"type":      "url-test",
+			"proxies":   liveNames,
+			"url":       "http://www.gstatic.com/generate_204",
+			"interval":  300,
+			"tolerance": 50,
+		}}, proxyGroups...)
+		proxyNames = append([]string{"LIVE"}, proxyNames...)
+		proxyGroups[1]["proxies"] = proxyNames
+	}
+
 	config := map[string]any{
-		"proxies": proxies,
-		"proxy-groups": []map[string]any{{
-			"name":    "PROXY",
-			"type":    "select",
-			"proxies": proxyNames,
-		}},
-		"rules": []string{"MATCH,PROXY"},
+		"proxies":      proxies,
+		"proxy-groups": proxyGroups,
+		"rules":        []string{"MATCH,PROXY"},
 	}
 
 	// Custom Clash routing can inject Mihomo-only groups, rules, providers or a
