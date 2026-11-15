@@ -41,9 +41,12 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v7
       - name: Verify fork patches are present
+        # The Windows job declares pwsh/msys2 per step; with no explicit shell
+        # this step falls back to pwsh there, where grep does not exist.
+        shell: bash
         run: |
           set -euo pipefail
-          grep -q 'paid sponsor placements are disabled unconditionally' \
+          grep -q 'paid sponsor placements are disabled unconditionally' \\
             internal/web/service/panel/sponsor.go || {
               echo "::error=sponsor opt-out is missing; refusing to publish an ad-bearing build"
               exit 1
@@ -229,9 +232,12 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v7
       - name: Verify fork patches are present
+        # The Windows job declares pwsh/msys2 per step; with no explicit shell
+        # this step falls back to pwsh there, where grep does not exist.
+        shell: bash
         run: |
           set -euo pipefail
-          grep -q 'paid sponsor placements are disabled unconditionally' \
+          grep -q 'paid sponsor placements are disabled unconditionally' \\
             internal/web/service/panel/sponsor.go || {
               echo "::error=sponsor opt-out is missing; refusing to publish an ad-bearing build"
               exit 1
@@ -394,9 +400,12 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v7
       - name: Verify fork patches are present
+        # The Windows job declares pwsh/msys2 per step; with no explicit shell
+        # this step falls back to pwsh there, where grep does not exist.
+        shell: bash
         run: |
           set -euo pipefail
-          grep -q 'paid sponsor placements are disabled unconditionally' \
+          grep -q 'paid sponsor placements are disabled unconditionally' \\
             internal/web/service/panel/sponsor.go || {
               echo "::error=sponsor opt-out is missing; refusing to publish an ad-bearing build"
               exit 1
