@@ -186,15 +186,39 @@ func (s *SubClashService) getClash(subId string, host string, legacy bool) (stri
 	}
 	proxyNames = append(proxyNames, "DIRECT")
 
-	// FORK: when a client is reachable on more than one port, publish a
-	// url-test group so the subscription fails over by itself. PROXY stays
-	// `select` so manual pinning keeps working; it only gains LIVE as its
-	// first member. sing-box clients get this from upstream sub_balancers.
-	liveNames := make([]string, 0, len(proxyNames))
-	for _, n := range proxyNames {
-		if n != "DIRECT" {
-			liveNames = append(liveNames, n)
+	// FORK: publish a url-test group so the subscription fails over between
+	// ports by itself. PROXY stays `select`, so manual pinning still works;
+	// it only gains LIVE as its first member. sing-box gets this from the
+	// upstream sub_balancers feature instead.
+	//
+	// Keyed by PORT, not by node: an airport puts thousands of clients on one
+	// inbound, and repeating that list here multiplies the config size. Upstream
+	// caps a rendered subscription at 16 MB (render_budget_test.go), which the
+	// naive version of this group blew straight through.
+	liveSeen := map[int]bool{}
+	liveNames := make([]string, 0, 4)
+	for _, proxy := range proxies {
+		if isDummyProxy(proxy) {
+			continue
 		}
+		name, ok := proxy["name"].(string)
+		if !ok || name == "" {
+			continue
+		}
+		var port int
+		switch p := proxy["port"].(type) {
+		case int:
+			port = p
+		case float64:
+			port = int(p)
+		default:
+			continue
+		}
+		if liveSeen[port] {
+			continue
+		}
+		liveSeen[port] = true
+		liveNames = append(liveNames, name)
 	}
 	proxyGroups := []map[string]any{{
 		"name":    "PROXY",
