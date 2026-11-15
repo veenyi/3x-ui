@@ -46,13 +46,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          grep -q 'paid sponsor placements are disabled unconditionally' \\
-            internal/web/service/panel/sponsor.go || {
-              echo "::error=sponsor opt-out is missing; refusing to publish an ad-bearing build"
-              exit 1
-            }
+          # No backslashes here: this block is embedded through a raw string,
+          # so `\.` would stay literal and a line continuation would break.
+          if ! grep -q 'disabled unconditionally' internal/web/service/panel/sponsor.go; then
+            echo "::error=sponsor opt-out is missing; refusing to publish an ad-bearing build"
+            exit 1
+          fi
           for s in install.sh update.sh x-ui.sh; do
-            if grep -qiE 'github\.com/MHSanaei/3x-ui/releases|raw\.githubusercontent\.com/MHSanaei/3x-ui' "$s"; then
+            if grep -qiE 'github[.]com/MHSanaei/3x-ui/releases|raw[.]githubusercontent[.]com/MHSanaei/3x-ui' "$s"; then
               echo "::error=$s still points at upstream; updates would reinstall the ad version"
               exit 1
             fi
@@ -237,13 +238,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          grep -q 'paid sponsor placements are disabled unconditionally' \\
-            internal/web/service/panel/sponsor.go || {
-              echo "::error=sponsor opt-out is missing; refusing to publish an ad-bearing build"
-              exit 1
-            }
+          # No backslashes here: this block is embedded through a raw string,
+          # so `\.` would stay literal and a line continuation would break.
+          if ! grep -q 'disabled unconditionally' internal/web/service/panel/sponsor.go; then
+            echo "::error=sponsor opt-out is missing; refusing to publish an ad-bearing build"
+            exit 1
+          fi
           for s in install.sh update.sh x-ui.sh; do
-            if grep -qiE 'github\.com/MHSanaei/3x-ui/releases|raw\.githubusercontent\.com/MHSanaei/3x-ui' "$s"; then
+            if grep -qiE 'github[.]com/MHSanaei/3x-ui/releases|raw[.]githubusercontent[.]com/MHSanaei/3x-ui' "$s"; then
               echo "::error=$s still points at upstream; updates would reinstall the ad version"
               exit 1
             fi
@@ -405,13 +407,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          grep -q 'paid sponsor placements are disabled unconditionally' \\
-            internal/web/service/panel/sponsor.go || {
-              echo "::error=sponsor opt-out is missing; refusing to publish an ad-bearing build"
-              exit 1
-            }
+          # No backslashes here: this block is embedded through a raw string,
+          # so `\.` would stay literal and a line continuation would break.
+          if ! grep -q 'disabled unconditionally' internal/web/service/panel/sponsor.go; then
+            echo "::error=sponsor opt-out is missing; refusing to publish an ad-bearing build"
+            exit 1
+          fi
           for s in install.sh update.sh x-ui.sh; do
-            if grep -qiE 'github\.com/MHSanaei/3x-ui/releases|raw\.githubusercontent\.com/MHSanaei/3x-ui' "$s"; then
+            if grep -qiE 'github[.]com/MHSanaei/3x-ui/releases|raw[.]githubusercontent[.]com/MHSanaei/3x-ui' "$s"; then
               echo "::error=$s still points at upstream; updates would reinstall the ad version"
               exit 1
             fi
