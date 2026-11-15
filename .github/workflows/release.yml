@@ -5,8 +5,6 @@ on:
   # Only main (dev channel) and version tags ship binaries; build any other
   # branch on demand via workflow_dispatch.
   push:
-    branches:
-      - main
     tags:
       - "v*.*.*-nosponsor"  # fork tag pattern
     paths:
@@ -31,11 +29,6 @@ jobs:
         platform:
           - amd64
           - arm64
-          - armv7
-          - armv6
-          - 386
-          - armv5
-          - s390x
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
