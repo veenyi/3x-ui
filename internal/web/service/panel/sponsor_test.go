@@ -174,7 +174,7 @@ func TestGetSponsorLogoCachesFailuresAndKeepsLastImage(t *testing.T) {
 
 	const wantErr = "sponsor logo fake.png has content type text/plain; charset=utf-8"
 	for range 2 {
-		if _, _, err := svc.GetSponsorLogo("fake.png"); err == nil || err.Error() != wantErr {
+		if _, _, err := svc.getSponsorLogoUpstream("fake.png"); err == nil || err.Error() != wantErr {
 			t.Fatalf("fake.png err = %v, want %q", err, wantErr)
 		}
 	}
@@ -182,12 +182,12 @@ func TestGetSponsorLogoCachesFailuresAndKeepsLastImage(t *testing.T) {
 		t.Fatalf("remote hits = %d, want 2 (list + one fake.png fetch; the failure must be cached)", n)
 	}
 
-	if _, _, err := svc.GetSponsorLogo("acme.png"); err != nil {
+	if _, _, err := svc.getSponsorLogoUpstream("acme.png"); err != nil {
 		t.Fatal(err)
 	}
 	failSponsorLogos.Store(true)
 	now = now.Add(sponsorsTTL)
-	data, ctype, err := svc.GetSponsorLogo("acme.png")
+	data, ctype, err := svc.getSponsorLogoUpstream("acme.png")
 	if err != nil || ctype != "image/png" || string(data) != string(pngMagic) {
 		t.Fatalf("acme.png after failed refresh = %q, %q, %v; want the last good image", data, ctype, err)
 	}
@@ -211,12 +211,12 @@ func TestGetSponsorLogo(t *testing.T) {
 		{"id":"old","slots":["page"],"until":"2000-01-01T00:00:00Z","link":"https://o.example/","logo":"old.png"}]}`)
 	svc := &PanelService{}
 
-	data, ctype, err := svc.GetSponsorLogo("acme.png")
+	data, ctype, err := svc.getSponsorLogoUpstream("acme.png")
 	if err != nil || ctype != "image/png" || string(data) != string(pngMagic) {
 		t.Fatalf("acme.png = %q, %q, %v; want png bytes", data, ctype, err)
 	}
 	before := hits.Load()
-	if _, _, err := svc.GetSponsorLogo("acme.png"); err != nil {
+	if _, _, err := svc.getSponsorLogoUpstream("acme.png"); err != nil {
 		t.Fatal(err)
 	}
 	if hits.Load() != before {
@@ -224,11 +224,11 @@ func TestGetSponsorLogo(t *testing.T) {
 	}
 
 	for _, name := range []string{"old.png", "other.png", "../sponsors.json"} {
-		if _, _, err := svc.GetSponsorLogo(name); !errors.Is(err, ErrSponsorLogoUnknown) {
+		if _, _, err := svc.getSponsorLogoUpstream(name); !errors.Is(err, ErrSponsorLogoUnknown) {
 			t.Errorf("%s: err = %v, want ErrSponsorLogoUnknown", name, err)
 		}
 	}
-	_, _, err = svc.GetSponsorLogo("fake.png")
+	_, _, err = svc.getSponsorLogoUpstream("fake.png")
 	if want := "sponsor logo fake.png has content type text/plain; charset=utf-8"; err == nil || err.Error() != want {
 		t.Errorf("fake.png: err = %v, want %q", err, want)
 	}
