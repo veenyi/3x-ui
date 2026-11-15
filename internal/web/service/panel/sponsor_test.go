@@ -145,18 +145,18 @@ func TestGetSponsorsKeepsLastListWhenRefreshFails(t *testing.T) {
 	now := sponsorTestNow
 	sponsorNow = func() time.Time { return now }
 	svc := &PanelService{}
-	if got, err := svc.GetSponsors(); err != nil || len(got.Sponsors) != 1 {
+	if got, err := svc.getUpstreamSponsors(); err != nil || len(got.Sponsors) != 1 {
 		t.Fatalf("first call = %+v, %v; want 1 sponsor", got, err)
 	}
 
 	failSponsorList.Store(true)
 	now = now.Add(sponsorsTTL)
-	got, err := svc.GetSponsors()
+	got, err := svc.getUpstreamSponsors()
 	if err != nil || len(got.Sponsors) != 1 || got.Sponsors[0].ID != "acme" {
 		t.Fatalf("after failed refresh = %+v, %v; want the last good sponsor kept", got, err)
 	}
 	now = now.Add(sponsorsErrTTL - time.Second)
-	if _, err := svc.GetSponsors(); err != nil {
+	if _, err := svc.getUpstreamSponsors(); err != nil {
 		t.Fatal(err)
 	}
 	if n := hits.Load(); n != 2 {
@@ -241,12 +241,12 @@ func TestGetSponsorsCachesAndExpiresWhileCached(t *testing.T) {
 	sponsorNow = func() time.Time { return now }
 	svc := &PanelService{}
 
-	got, err := svc.GetSponsors()
+	got, err := svc.getUpstreamSponsors()
 	if err != nil || len(got.Sponsors) != 1 {
 		t.Fatalf("first call = %+v, %v; want 1 sponsor", got, err)
 	}
 	now = now.Add(45 * time.Minute)
-	got, err = svc.GetSponsors()
+	got, err = svc.getUpstreamSponsors()
 	if err != nil || len(got.Sponsors) != 0 {
 		t.Fatalf("after until = %+v, %v; want 0 sponsors", got, err)
 	}
@@ -254,7 +254,7 @@ func TestGetSponsorsCachesAndExpiresWhileCached(t *testing.T) {
 		t.Fatalf("remote hits = %d, want 1 (cached within TTL)", n)
 	}
 	now = now.Add(sponsorsTTL)
-	if _, err := svc.GetSponsors(); err != nil {
+	if _, err := svc.getUpstreamSponsors(); err != nil {
 		t.Fatal(err)
 	}
 	if n := hits.Load(); n != 2 {
@@ -264,7 +264,7 @@ func TestGetSponsorsCachesAndExpiresWhileCached(t *testing.T) {
 
 func TestGetSponsorsRejectsOversizeBody(t *testing.T) {
 	setupSponsorServer(t, `{"contact":"`+strings.Repeat("a", maxSponsorsBytes)+`"}`)
-	_, err := (&PanelService{}).GetSponsors()
+	_, err := (&PanelService{}).getUpstreamSponsors()
 	want := sponsorsURL + " exceeds 262144 bytes"
 	if err == nil || err.Error() != want {
 		t.Fatalf("err = %v, want %q", err, want)
@@ -293,7 +293,7 @@ func TestGetSponsorsDebugReadsLocalCheckout(t *testing.T) {
 	svc := &PanelService{}
 	for _, id := range []string{"first", "edited"} {
 		write(id)
-		got, err := svc.GetSponsors()
+		got, err := svc.getUpstreamSponsors()
 		if err != nil || len(got.Sponsors) != 1 || got.Sponsors[0].ID != id {
 			t.Fatalf("GetSponsors() = %+v, %v; want local sponsor %q", got, err, id)
 		}
@@ -301,4 +301,14 @@ func TestGetSponsorsDebugReadsLocalCheckout(t *testing.T) {
 	if n := hits.Load(); n != 0 {
 		t.Fatalf("remote hits = %d, want 0 in debug mode", n)
 	}
+}
+
+// getUpstreamSponsors exercises the retained original implementation. The fork
+// short-circuits cachedSponsors, so upstream's behaviour tests target this.
+func (s *PanelService) getUpstreamSponsors() (*SponsorList, error) {
+	raw, err := cachedSponsorsUpstream()
+	if err != nil {
+		return nil, err
+	}
+	return activeSponsors(raw, sponsorNow()), nil
 }
