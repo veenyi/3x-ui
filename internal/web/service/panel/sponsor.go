@@ -87,17 +87,16 @@ func (s *PanelService) GetSponsors() (*SponsorList, error) {
 	return activeSponsors(raw, sponsorNow()), nil
 }
 
-// sponsorsDisabled reports whether the operator opted out of the paid sponsor
-// slots. Upstream declined an opt-out (MHSanaei/3x-ui#6845, #6856, #6818 are all
-// closed as not_planned), so this fork reads XUI_DISABLE_SPONSORS itself.
-func sponsorsDisabled() bool {
-	return os.Getenv("XUI_DISABLE_SPONSORS") == "true"
+func cachedSponsors() (*SponsorList, error) {
+	// FORK: paid sponsor placements are disabled unconditionally. Upstream
+	// declined every opt-out request (MHSanaei/3x-ui#6845, #6856, #6818 are
+	// all closed as not_planned), so this fork removes the feature instead of
+	// gating it: no request ever leaves the box, and an operator cannot
+	// re-enable it by forgetting a systemd drop-in.
+	return &SponsorList{Sponsors: []Sponsor{}}, nil
 }
 
-func cachedSponsors() (*SponsorList, error) {
-	if sponsorsDisabled() {
-		return &SponsorList{Sponsors: []Sponsor{}}, nil
-	}
+func cachedSponsorsUpstream() (*SponsorList, error) {
 	sponsorsMu.Lock()
 	defer sponsorsMu.Unlock()
 	now := sponsorNow()
