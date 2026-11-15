@@ -71,7 +71,7 @@ resource "threexui_inbound_client" "primary" {
   inbound_id  = threexui_inbound.primary.id
   email       = var.client_email
   client_id   = var.client_uuid
-  flow        = "xtls-rsv1"
+  flow        = "xtls-rprx-vision"
   enable      = true
   total_gb    = var.total_gb
   sub_id      = var.client_sub_id
@@ -82,7 +82,7 @@ resource "threexui_inbound_client" "fallback" {
   inbound_id  = threexui_inbound.fallback.id
   email       = var.client_email
   client_id   = var.client_uuid
-  flow        = "xtls-rsv1"
+  flow        = "xtls-rprx-vision"
   enable      = true
   total_gb    = var.total_gb
   sub_id      = var.client_sub_id
