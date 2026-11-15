@@ -43,6 +43,22 @@ sponsor slot (login/dashboard/page) renders nothing. Default is off, so
 sponsor_test.go, which stubs sponsorsURL itself, still passes."
 fi
 
+# The fork inherits upstream's release.yml and docker.yml, both of which fire on
+# `push: tags`. Without this the tag push below publishes a public release on
+# every upgrade. See FORK-NOTES.md.
+for wf in release.yml docker.yml; do
+  if git ls-files --error-unmatch ".github/workflows/$wf" >/dev/null 2>&1; then
+    git rm -q ".github/workflows/$wf"
+    echo "==> removed .github/workflows/$wf"
+  fi
+done
+if ! git diff --cached --quiet; then
+  git commit -q -m "fork: drop upstream release/docker workflows
+
+They publish a public release whenever sync-upstream.sh pushes a tag. This fork
+only needs build-xui-nosponsors.yml."
+fi
+
 NEW_TAG="${TAG}-nosponsor"
 echo "==> pushing $BRANCH and tagging $NEW_TAG"
 git push -f origin "$BRANCH"
