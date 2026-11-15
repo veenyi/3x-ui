@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# xui-watchdog — cheap health checks for a 3x-ui box, meant for cron.
+#
+# Exit 0 = all good. Non-zero = number of failed checks, and each failure is
+# logged. No external alerting is wired up because this host has no Telegram /
+# SMTP / Discord credentials configured; set NOTIFY_CMD to plug one in.
+set -uo pipefail
+
+LOG=/var/log/xui-watchdog.log
+STATUS=/run/xui-watchdog-status
+DB=/etc/x-ui/x-ui.db
+CERT=/root/cert/ip/fullchain.pem
+NOTIFY_CMD="${NOTIFY_CMD:-}"          # e.g. "/usr/local/bin/notify.sh %s"
+
+fail=0
+note() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$1" | tee -a "$LOG" >&2; }
+check() { # $1 label, $2 detail
+  note "FAIL  $1: $2"
+  fail=$((fail+1))
+}
+
+dbval() {
+  # Pass the key as argv and quote the python source in single quotes. A bare
+  # `except: print('')` here once swallowed an IndexError and made every check
+  # silently read an empty port, so a broken watchdog reported "ok".
+  python3 -c '
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+rows = list(c.execute("select value from settings where key=?", (sys.argv[2],)))
+print(rows[0][0] if rows else "")
+' "$DB" "$1"
+}
+
+WEB_PORT=$(dbval webPort)
+SUB_PORT=$(dbval subPort)
+BASE=$(dbval webBasePath)
+
+# --- 1. TLS certificate -------------------------------------------------
+if [ -f "$CERT" ]; then
+  END=$(openssl x509 -in "$CERT" -noout -enddate 2>/dev/null | cut -d= -f2)
+  END_S=$(date -d "$END" +%s 2>/dev/null || echo 0)
+  LEFT=$(( (END_S - $(date +%s)) / 86400 ))
+  if [ "$LEFT" -lt 2 ]; then
+    check cert "only ${LEFT}d left (expires ${END}); acme.sh renewal is not keeping up"
+  else
+    note "ok    cert ${LEFT}d left"
+  fi
+  # A renewed file that the running panel never loaded is the silent failure
+  # mode here: compare what acme.sh deployed against what the port serves.
+  FILE_FP=$(openssl x509 -in "$CERT" -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2 | tr -d ':')
+  LIVE_FP=$(echo | timeout 10 openssl s_client -connect "127.0.0.1:${WEB_PORT}" -servername 23.147.68.103 2>/dev/null \
+            | openssl x509 -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2 | tr -d ':')
+  if [ -n "$LIVE_FP" ] && [ "$FILE_FP" != "$LIVE_FP" ]; then
+    check cert-reload "panel is serving a different cert than ${CERT} (restart x-ui after renewal)"
+  fi
+else
+  check cert "$CERT missing"
+fi
+
+# --- 2. services and listeners -----------------------------------------
+systemctl is-active --quiet x-ui || check service "x-ui not active"
+for p in "$WEB_PORT" "$SUB_PORT"; do
+  [ -n "$p" ] || continue
+  ss -lnt 2>/dev/null | grep -q ":$p " || check listener "nothing listening on $p"
+done
+INBOUND_PORTS=$(python3 -c "
+import sqlite3
+print(' '.join(str(r[0]) for r in sqlite3.connect('$DB').execute('select port from inbounds where enable=1')))
+")
+for p in $INBOUND_PORTS; do
+  ss -lnt 2>/dev/null | grep -q ":$p " || check inbound "inbound port $p is enabled in the DB but not listening"
+done
+
+# --- 3. subscription actually yields a usable node ----------------------
+SUB_ID=$(python3 -c "
+import sqlite3
+r=list(sqlite3.connect('$DB').execute('select sub_id from clients where enable=1 limit 1'))
+print(r[0][0] if r else '')
+")
+CLASH_PATH=$(dbval subClashPath)
+if [ -n "$SUB_ID" ]; then
+  # 3x-ui builds each node's `server` from the request Host header. Probing via
+  # 127.0.0.1 therefore yields `server: localhost` and would look like a broken
+  # subscription when it is not. Send the address real clients use.
+  PUBIP=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="src") print $(i+1)}' | head -1)
+  [ -n "$PUBIP" ] || PUBIP=$(hostname -I 2>/dev/null | awk '{print $1}')
+  URL="https://${PUBIP:-127.0.0.1}:${SUB_PORT}${CLASH_PATH%/}/${SUB_ID}"
+  Y=$(curl -sk -m 20 -w '\n%{http_code}' "$URL" 2>/dev/null)
+  CODE=$(printf '%s' "$Y" | tail -n1)
+  BODY=$(printf '%s' "$Y" | sed '$d')
+  if [ "$CODE" != "200" ]; then
+    check subscription "clash endpoint HTTP ${CODE:-no-response} at ${URL}"
+  elif ! printf '%s' "$BODY" | grep -q '^proxies:'; then
+    check subscription "clash endpoint returned no proxies stanza (body: $(printf '%s' "$BODY" | head -c 80))"
+  fi
+  printf '%s' "$BODY" | grep -qE '^\s*server:\s*(127\.|localhost)' \
+    && check subscription "node server came back as loopback for Host ${PUBIP}"
+  NODES=$(printf '%s' "$BODY" | grep -c '^  name:' || true)
+  note "ok    subscription ${NODES} node(s) via ${URL}"
+fi
+
+# --- 4. regression guard for the fork's sponsor patch ------------------
+# If this ever returns a sponsor, the running binary is not our build (an
+# accidental `x-ui update` from upstream, most likely).
+# webBasePath already carries a trailing slash; appending "/sponsors" would
+# produce a double slash and a 404.
+SP=$(curl -sk -m 15 "https://127.0.0.1:${WEB_PORT}${BASE%/}/sponsors" 2>/dev/null)
+if echo "$SP" | grep -q '"sponsors":\[\]'; then
+  note "ok    sponsors suppressed"
+else
+  check sponsor "endpoint did not return an empty list: ${SP:0:120}"
+fi
+
+printf '%s\n' "$fail" > "$STATUS"
+if [ "$fail" -gt 0 ]; then
+  note "SUMMARY $fail check(s) failed"
+  if [ -n "$NOTIFY_CMD" ]; then
+    printf 'x-ui watchdog: %s failures on %s\n' "$fail" "$(hostname)" | "$NOTIFY_CMD" /dev/stdin || true
+  fi
+else
+  note "SUMMARY all checks passed"
+fi
+exit "$fail"
