@@ -87,7 +87,17 @@ func (s *PanelService) GetSponsors() (*SponsorList, error) {
 	return activeSponsors(raw, sponsorNow()), nil
 }
 
+// sponsorsDisabled reports whether the operator opted out of the paid sponsor
+// slots. Upstream declined an opt-out (MHSanaei/3x-ui#6845, #6856, #6818 are all
+// closed as not_planned), so this fork reads XUI_DISABLE_SPONSORS itself.
+func sponsorsDisabled() bool {
+	return os.Getenv("XUI_DISABLE_SPONSORS") == "true"
+}
+
 func cachedSponsors() (*SponsorList, error) {
+	if sponsorsDisabled() {
+		return &SponsorList{Sponsors: []Sponsor{}}, nil
+	}
 	sponsorsMu.Lock()
 	defer sponsorsMu.Unlock()
 	now := sponsorNow()
