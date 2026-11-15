@@ -67,6 +67,16 @@ sudo systemctl daemon-reload && sudo systemctl restart x-ui
 
 每次上游发新版，跑一次 `./scripts/sync-upstream.sh v新版本号`。补丁冲突时脚本会明确报错并告诉你改哪里，不会静默产出还带广告的包——workflow 里有一步 `grep XUI_DISABLE_SPONSORS` 断言，补丁丢了构建直接失败。
 
+### sync-upstream.sh 还会删掉两个上游 workflow（非显而易见）
+
+fork 继承了上游的 `.github/workflows/release.yml` 和 `docker.yml`，两者都是 `on: push: tags`。也就是说**只要推 tag，它们就会在你的 fork 上发布一个公开 release**。脚本因此在打完补丁后 `git rm` 这两个文件并单独提交。
+
+保留的只有 `build-xui-nosponsors.yml`，它产出的是 Actions **artifact**，不是 release；实测匿名下载 artifact 返回 401、日志 403，只有 artifacts 列表元数据公开可见。
+
+如果哪天需要上游的 Docker 镜像构建，不要直接恢复 `docker.yml`——它同样会触发公开发布，改成只在你手动 `workflow_dispatch` 时运行。
+
+已发生的一次公开 release 已删除（`releases` 数为 0），fork 默认分支 `main` 上的这两个文件也已移除，tag `v3.11.0-nosponsor` 重新指向不含它们的 commit。注意 fork 仓库本身仍是公开的，源码可见（GPLv3 允许）。
+
 ## 临时替代方案（不构建的话）
 
 `/etc/hosts` 加 `127.0.0.1 raw.githubusercontent.com`。已核实影响面：面板进程用它只做 3 件事——`sponsors.json`、赞助 logo、`update.sh`；xray 内核升级、geoip/geosite、版本提醒走 `api.github.com` / `github.com`，不受影响。代价是升级面板前要临时删掉这行。
