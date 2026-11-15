@@ -1,0 +1,13 @@
+# Blocks public access to the looking-glass speedtest port. That endpoint
+# streams arbitrary-size files with no auth, so any visitor can drain the
+# monthly quota or use this box in amplification abuse.
+# XQS_PUBLIC_IP is substituted by xui-quickstart; leave it as-is in the repo.
+table inet xui_lgl_guard {
+        chain in {
+                type filter hook input priority -200; policy accept;
+                tcp dport 64260 iif "lo" accept
+                tcp dport 64260 ip saddr XQS_PUBLIC_IP accept
+                tcp dport 64260 ip6 saddr ::1 accept
+                tcp dport 64260 counter drop
+        }
+}
