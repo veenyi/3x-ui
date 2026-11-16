@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+# xui-restore — turn a xui-backup tarball back into a running panel.
+#
+#   xui-restore              # check the newest backup and diff it against live
+#   xui-restore --apply      # really restore it (current DB copied aside first)
+#   xui-restore --from F --apply
+#
+# Checking is the default because a backup is usually OLDER than the live panel:
+# restoring one blindly deletes whatever changed since it was taken. The diff
+# tells you exactly what would be lost before you agree to it.
+set -uo pipefail
+
+DEST=/root/xui-backups
+DB=/etc/x-ui/x-ui.db
+DRILL=/root/xui-restore-check
+FROM=""
+APPLY=0
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --from) FROM="$2"; shift 2 ;;
+    --apply) APPLY=1; shift ;;
+    *) echo "unknown flag: $1" >&2; exit 2 ;;
+  esac
+done
+
+if [ -z "$FROM" ]; then
+  FROM=$(ls -1t "$DEST"/x-ui-backup-*.tar.gz 2>/dev/null | head -1)
+fi
+[ -n "$FROM" ] && [ -f "$FROM" ] || { echo "no backup found (looked in $DEST)" >&2; exit 1; }
+echo "backup: $FROM ($(du -h "$FROM" | cut -f1))"
+
+rm -rf "$DRILL"; mkdir -p "$DRILL/stage"
+# A tar listing is not proof: extract, then make the copy open.
+tar -xzf "$FROM" -C "$DRILL/stage" || { echo "FATAL: tar failed" >&2; exit 1; }
+TS_DIR=$(find "$DRILL/stage" -mindepth 1 -maxdepth 1 -type d | head -1)
+[ -n "$TS_DIR" ] || { echo "FATAL: tarball has no snapshot directory" >&2; exit 1; }
+[ -f "$TS_DIR/x-ui.db" ] || { echo "FATAL: snapshot has no x-ui.db" >&2; exit 1; }
+
+cp "$TS_DIR/x-ui.db" "$DRILL/restored.db"
+if ! python3 - "$DRILL/restored.db" <<'PYEOF'
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+tables = {r[0] for r in c.execute("select name from sqlite_master where type='table'")}
+need = {"settings", "inbounds", "clients", "client_inbounds"}
+missing = need - tables
+counts = {t: list(c.execute("select count(*) from %s" % t))[0][0] for t in sorted(need & tables)}
+print("   tables ok:", not missing, counts)
+assert not missing, "missing tables: %s" % sorted(missing)
+assert counts.get("settings", 0) > 0, "empty settings table"
+assert counts.get("inbounds", 0) > 0, "no inbounds: panel would come up with nothing listening"
+PYEOF
+then
+  echo "FATAL: restored database does not open or is empty" >&2
+  exit 1
+fi
+
+echo "   what the snapshot says:"
+python3 - "$DRILL/restored.db" <<'PYEOF'
+import json, sqlite3, sys
+c = sqlite3.connect(sys.argv[1]); c.row_factory = sqlite3.Row
+d = dict((str(k), str(v)) for k, v in c.execute("select key,value from settings"))
+print("     panel https" if d.get("webCertFile") else "     panel HTTP",
+      "port=%s base=%s" % (d.get("webPort"), d.get("webBasePath")))
+print("     sub: clash=%s json=%s routing=%s" % (d.get("subClashEnable"), d.get("subJsonEnable"),
+                                                 d.get("subClashEnableRouting")))
+print("     inbounds:", [(r["port"], r["remark"], r["enable"]) for r in
+                         c.execute("select port,remark,enable from inbounds order by id")])
+print("     clients:", [(r["email"], r["flow"] or "-") for r in c.execute("select email,flow from clients")])
+rules = d.get("subClashRules") or ""
+print("     clash rules: %d bytes, %d provider(s)" % (len(rules), rules.count("proxy_provider/")))
+PYEOF
+
+echo "   diff against the live panel (what --apply would overwrite):"
+python3 - "$DRILL/restored.db" "$DB" <<'PYEOF'
+import sqlite3, sys
+def snap(p):
+    c = sqlite3.connect(p)
+    d = dict((str(k), str(v)) for k, v in c.execute("select key,value from settings"))
+    ib = sorted((int(r[0]), str(r[1])) for r in c.execute("select port,remark from inbounds"))
+    cl = sorted((str(r[0]), str(r[1] or "")) for r in c.execute("select email,flow from clients"))
+    return d, ib, cl
+old, o_ib, o_cl = snap(sys.argv[1])
+new, n_ib, n_cl = snap(sys.argv[2])
+diff = sorted(k for k in set(old) | set(new) if str(old.get(k)) != str(new.get(k))
+              and not k.startswith(("last", "traffic", "secret")))
+for k in diff:
+    o = str(old.get(k))[:46].replace("\n", "\\n")
+    n = str(new.get(k))[:46].replace("\n", "\\n")
+    print("     ~ %-26s backup=%-48s live=%s" % (k, o, n))
+print("     inbounds same:", o_ib == n_ib, "| clients same:", o_cl == n_cl)
+if o_ib != n_ib:
+    print("       backup:", o_ib)
+    print("       live  :", n_ib)
+PYEOF
+
+if [ "$APPLY" != "1" ]; then
+  echo "check-only: nothing written. Re-run with --apply to restore (the live DB is"
+  echo "copied to /root/xui-restore-check/pre-apply.db first)."
+  exit 0
+fi
+
+echo "==> applying"
+mkdir -p /root/xui-restore-check
+cp -a "$DB" "/root/xui-restore-check/pre-apply.db"
+echo "    live DB saved: /root/xui-restore-check/pre-apply.db"
+systemctl stop x-ui
+# WAL files from the dead instance would shadow the restored image.
+rm -f "$DB-wal" "$DB-shm"
+cp -a "$TS_DIR/x-ui.db" "$DB"
+chmod 600 "$DB"
+for f in x-ui.service dropins; do
+  [ -e "$TS_DIR/systemd/$f" ] && cp -a "$TS_DIR/systemd/$f" "/etc/systemd/system/${f/dropins/x-ui.service.d}" 2>/dev/null
+done
+[ -f "$TS_DIR/crontab.txt" ] && crontab "$TS_DIR/crontab.txt"
+systemctl start x-ui
+
+PORT=$(python3 -c "
+import sqlite3
+print(dict(sqlite3.connect('$DB').execute('select key,value from settings'))['webPort'])")
+for _ in $(seq 1 30); do
+  curl -sk -m 4 -o /dev/null "https://127.0.0.1:$PORT/" && break
+  sleep 2
+done
+echo "    post-restore state:"
+python3 - "$DB" <<'PYEOF'
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+print("      settings:", list(c.execute("select count(*) from settings"))[0][0],
+      "inbounds:", list(c.execute("select count(*) from inbounds"))[0][0],
+      "clients:", list(c.execute("select count(*) from clients"))[0][0])
+PYEOF
+/usr/local/bin/xui-watchdog 2>&1 | tail -6
+echo "==> restored from $(basename "$FROM"); to undo: systemctl stop x-ui && cp -a /root/xui-restore-check/pre-apply.db $DB && systemctl start x-ui"
