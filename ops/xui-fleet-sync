@@ -119,22 +119,56 @@ def read_ssh(src):
     return out.stdout.split("=CLASH=")[-1].split("=LINKS=")[0]
 
 
+NAME_RE = r"(?m)^\s*(?:-\s+)?name:\s*(.+?)\s*$"
+
+
 def name_of(block):
-    m = re.search(r"(?m)^\s*name:\s*(.+?)\s*$", block)
+    # The `- ` must be allowed: yaml.safe_dump keeps dict order, and an
+    # upstream proxy starts with `- name: ...` on the first line. Without this
+    # the 90 upstream nodes all read as nameless and were dropped silently.
+    m = re.search(NAME_RE, block)
     return m.group(1).strip().strip("'\"") if m else None
 
 
 def set_name(block, new):
-    return re.sub(r"(?m)^(\s*name:).*$", r"\g<1> %s" % new, block, count=1)
+    """Rename via parse+dump, never by regex substitution.
+
+    Upstream names carry colons and pipes ("Traffic: 31.28 GB | 1000 GB");
+    writing one unquoted produced invalid YAML, the panel's parser rejected the
+    entire rules blob and silently served its own 2-node config instead --
+    which looked like the upstream had vanished.
+    """
+    try:
+        import yaml
+        items = yaml.safe_load(block)
+        if isinstance(items, list) and items and isinstance(items[0], dict):
+            items[0]["name"] = new
+            return yaml.safe_dump(items, allow_unicode=True, sort_keys=False,
+                                  width=10 ** 6).rstrip("\n")
+    except Exception:
+        pass
+    return re.sub(r"(?m)^(\s*(?:-\s+)?name:).*$", r"\g<1> '%s'" % new.replace("'", "''"),
+                  block, count=1)
 
 
 def proxy_blocks(text):
-    """Every `- ` item of the proxies section, kept as its own YAML block.
+    """Return each proxy as its own YAML block, dash at column 0.
 
-    3x-ui writes clash proxies in block style sorted by key, so a proxy always
-    begins at column 0 with `- ` and the next one does too.
+    Parsed rather than regex-split: panel output is block style at column 0,
+    but an exported clash profile writes flow-style items with indentation
+    (`  - {name: ..., server: ...}`), which a `^- ` scan silently drops --
+    that is how the upstream's 90 nodes would vanish without any error.
     """
-    head = text.split("proxy-groups:")[0].split("proxies:", 1)[-1]
+    head = text.split("proxy-groups:")[0] if "proxy-groups:" in text else text
+    try:
+        import yaml
+        doc = yaml.safe_load(head) or {}
+        px = doc.get("proxies") or []
+        return [yaml.safe_dump([p], allow_unicode=True, sort_keys=False,
+                               default_flow_style=False, width=10 ** 6).rstrip("\n")
+                for p in px if isinstance(p, dict) and p.get("name") and p.get("server")]
+    except Exception:
+        pass
     blocks = []
     for b in re.split(r"\n(?=- )", "\n" + head.strip()):
         b = b.strip("\n")
@@ -143,7 +177,19 @@ def proxy_blocks(text):
     return blocks
 
 
-def build_rules(entries, providers, region):
+def read_file(path):
+    """Upstream nodes from an exported clash profile on this host.
+
+    Provider mode is nicer, but it only works while the upstream URL actually
+    serves nodes: huacloud answered 400 "The following link doesn't contain any
+    valid node" and the inner xmancdn link 404/403, which left the client with
+    a broken provider and a profile it could not load. Inlining keeps the
+    subscription self-contained; refresh by re-copying the file.
+    """
+    return open(path, encoding="utf-8").read()
+
+
+def build_rules(entries, providers, region, up_names=None):
     lines = []
     # A header the panel UI can actually show. The upstream lives only in this
     # text blob -- the panel's own "outbound subscriptions" list is unusable for
@@ -151,25 +197,32 @@ def build_rules(entries, providers, region):
     # its endpoint -- so without these lines the URL is invisible to anyone who
     # opens 面板设置 → 订阅设置 → Clash 自定义规则.
     lines.append("# 由 xui-fleet-sync 生成，请勿手改（下次同步会覆盖）。")
-    lines.append("# 自建节点已内联在下方 proxies:；上游订阅由客户端自行拉取"
-                 "（服务端拉必然 403：提供方按地区拦截）。")
+    lines.append("# 自建节点已内联在下方 proxies:。")
+    active = [p for p in providers if p.get("enabled", True)]
     for p in providers:
-        lines.append("# 上游 %-10s 刷新 %ss  url: %s"
-                     % (p["name"], p.get("interval", 3600), p["url"]))
+        lines.append("# 上游 %-10s %s  url: %s" % (
+            p["name"],
+            ("provider 模式，刷新 %ss" % p.get("interval", 3600)) if p.get("enabled", True)
+            else "已内联（源头当前拉不到，恢复后把 fleet.json 的 enabled 改回 true）",
+            p["url"]))
     lines.append("proxies:")
     lines += [e["block"] for e in entries]
 
-    if providers:
+    if active:
         lines.append("proxy-providers:")
-        for p in providers:
+        for p in active:
             lines += ["  %s:" % p["name"],
                       "    type: http",
                       "    url: %s" % p["url"],
                       "    interval: %d" % p.get("interval", 3600),
                       "    path: ./proxy_provider/%s.yaml" % p["name"],
                       "    format: yaml",
+                      # mihomo declares header as []string of "Key: Value", not a
+                      # mapping. A map here makes the whole profile fail to load:
+                      # "parse proxy provider flower error: 'header[User-Agent]'
+                      # is not a slice" (seen in FlClash on 2026-11-16).
                       "    header:",
-                      "      User-Agent: clash/1.18.0",
+                      '      - "User-Agent: clash/1.18.0"',
                       "    health-check:",
                       "      enable: true",
                       "      url: http://www.gstatic.com/generate_204",
@@ -177,17 +230,28 @@ def build_rules(entries, providers, region):
                       "      timeout: 5"]
 
     names = [e["name"] for e in entries]
+    self_names = [e["name"] for e in entries if e.get("role") != "upstream"]
+    up_names = list(up_names or []) + [e["name"] for e in entries if e.get("role") == "upstream"]
     groups = []
-    if len(names) > 1:
+    if len(self_names) > 1:
+        # url-test only over our own ports: an upstream ss node on another
+        # provider's host would be pinged and rotated by us, and its latency
+        # has nothing to do with which of our Reality ports is best
         groups.append(["- name: LIVE", "  type: url-test", "  proxies:"] +
-                      ["    - %s" % n for n in names] +
+                      ["    - %s" % n for n in self_names] +
                       ["  url: http://www.gstatic.com/generate_204",
                        "  interval: 300", "  tolerance: 50", "  lazy: true"])
-    if providers:
-        groups.append(["- name: 上游订阅", "  type: select", "  use:"] +
-                      ["    - %s" % p["name"] for p in providers])
-    proxy_members = (["LIVE"] if len(names) > 1 else []) + names + \
-                    (["上游订阅"] if providers else []) + ["DIRECT"]
+    if active or up_names:
+        grp = ["- name: 上游订阅", "  type: select"]
+        if active:
+            grp += ["  use:"] + ["    - %s" % p["name"] for p in active]
+        grp += ["  proxies:"] + ["    - %s" % n for n in (up_names or [])]
+        if len(grp) == 3:      # select with neither use nor proxies fails to load
+            groups.append(grp[:2] + ["  proxies:", "    - DIRECT"])
+        else:
+            groups.append(grp)
+    proxy_members = (["LIVE"] if len(self_names) > 1 else []) + self_names + \
+                    (["上游订阅"] if (active or up_names) else []) + ["DIRECT"]
     groups.append(["- name: PROXY", "  type: select", "  proxies:"] +
                   ["    - %s" % m for m in proxy_members])
     groups.append(["- name: %s" % region, "  type: select", "  proxies:",
@@ -227,6 +291,9 @@ def verify(served_text, provider_names):
     defined = {p.get("name") for p in (doc.get("proxies") or [])}
     for g in doc.get("proxy-groups") or []:
         defined.add(g.get("name"))
+        # inline proxy objects inside a group are definitions too, not refs
+        defined.update(m.get("name") for m in (g.get("proxies") or [])
+                       if isinstance(m, dict))
     # members pulled in by `use:` come from providers, resolved at the client
     for g in doc.get("proxy-groups") or []:
         for p in g.get("use") or []:
@@ -235,6 +302,11 @@ def verify(served_text, provider_names):
     bad = []
     for g in doc.get("proxy-groups") or []:
         for m in (g.get("proxies") or []):
+            # the panel embeds some proxies inline as mappings; only a string
+            # member is a reference that can dangle
+            if isinstance(m, dict):
+                defined.add(m.get("name"))
+                continue
             if m not in defined:
                 bad.append("%s->%s" % (g.get("name"), m))
     n = len(doc.get("proxies") or [])
@@ -254,7 +326,8 @@ def main():
     for src in man["sources"]:
         try:
             reader = {"local": read_local, "url": lambda: read_url(src["url"]),
-                      "ssh": lambda: read_ssh(src)}[src["kind"]]
+                      "ssh": lambda: read_ssh(src),
+                      "file": lambda: read_file(src["path"])}[src["kind"]]
             text = reader()
         except KeyError:
             note("warn  %-10s unknown kind %r" % (src["name"], src["kind"]))
@@ -266,7 +339,9 @@ def main():
         # Ownership filter. Without it the front node reads back the siblings
         # it published into its own subscription last run and re-adds them with
         # a prefix, so the node list doubles every execution (6 -> 10 -> ...).
-        own = src.get("ip") or (detect_public_ip() if src["kind"] == "local" else "")
+        # Upstream sources are exempt: their servers are not ours by design.
+        own = "" if src.get("role") == "upstream" else (
+            src.get("ip") or (detect_public_ip() if src["kind"] == "local" else ""))
         if own:
             mine = [b for b in blocks
                     if re.search(r"(?m)^\s*server:\s*[\"']?%s\s*$" % re.escape(own), b)]
@@ -275,17 +350,39 @@ def main():
                     note("ok    %-10s dropped %d foreign node(s) it published earlier"
                          % (src["name"], len(blocks) - len(mine)))
                 blocks = mine
+        unnamed = 0
         for blk in blocks:
             nm = name_of(blk)
             if not nm:
+                unnamed += 1
                 continue
             if nm in taken:
                 nm = "%s %s" % (src["name"], nm)
             taken.add(nm)
-            entries.append({"name": nm, "block": set_name(blk, nm)})
-        note("ok    %-10s %d node(s) via %s" % (src["name"], len(blocks), src["kind"]))
+            entries.append({"name": nm, "block": set_name(blk, nm),
+                            "role": src.get("role", "selfbuilt")})
+        note("ok    %-10s %d node(s) via %s%s%s"
+             % (src["name"], len(blocks) - unnamed, src["kind"],
+                " [upstream]" if src.get("role") == "upstream" else "",
+                "  WARN dropped %d unnamed" % unnamed if unnamed else ""))
 
     rules = build_rules(entries, man.get("providers", []), man.get("region", "自建"))
+
+    # Never hand the panel something it cannot parse: an invalid blob makes it
+    # fall back to its own config with no error anywhere in the API response.
+    try:
+        import yaml
+        parsed = yaml.safe_load(rules)
+        n_prox = len((parsed or {}).get("proxies") or [])
+        if n_prox != len(entries):
+            note("abort %d entries built but only %d proxies parsed; refusing to publish"
+                 % (len(entries), n_prox))
+            return 2
+    except ImportError:
+        pass
+    except Exception as e:
+        note("abort generated rules are not valid YAML: %s" % str(e)[:160])
+        return 2
 
     import sqlite3
     c = sqlite3.connect(DB)
