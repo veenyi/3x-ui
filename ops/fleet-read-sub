@@ -1,0 +1,55 @@
+#!/usr/bin/env python3
+"""fleet-read-sub — the only thing node 1 is ever allowed to run on this host.
+
+Installed as the forced command of a restricted authorized_keys entry, so the
+key cannot open a shell, forward ports or read anything else:
+
+  command="python3 /root/.ssh/fleet-read-sub.py",restrict,from="23.147.68.103"
+
+It prints the node's own clash profile and link subscription, addressed with
+the public IP as Host because the panel renders `server:` from that header.
+"""
+import base64
+import sqlite3
+import ssl
+import sys
+import urllib.request
+
+DB = "/etc/x-ui/x-ui.db"
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
+
+def main():
+    c = sqlite3.connect(DB)
+    d = dict((str(k), str(v)) for k, v in c.execute("select key,value from settings"))
+    sub = list(c.execute("select sub_id from clients where enable=1 limit 1"))[0][0]
+    public = sys.argv[1] if len(sys.argv) > 1 else ""
+    scheme = "https" if d.get("subCertFile") else "http"
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+
+    def grab(path):
+        url = "%s://127.0.0.1:%s%s%s" % (scheme, d["subPort"], path, sub)
+        r = urllib.request.Request(url)
+        if public:
+            r.add_header("Host", "%s:%s" % (public, d["subPort"]))
+        r.add_header("User-Agent", "clash/1.18.0")
+        return urllib.request.urlopen(r, timeout=30, context=ctx).read().decode("utf-8")
+
+    print("=CLASH=")
+    print(grab(d["subClashPath"]))
+    print("=LINKS=")
+    body = grab(d["subPath"]).strip()
+    try:
+        body = base64.b64decode(body + "===").decode("utf-8")
+    except Exception:
+        pass
+    print(body)
+
+
+main()
