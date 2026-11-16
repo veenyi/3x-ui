@@ -84,19 +84,68 @@ if [ -n "$SUB_ID" ]; then
   # subscription when it is not. Send the address real clients use.
   PUBIP=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="src") print $(i+1)}' | head -1)
   [ -n "$PUBIP" ] || PUBIP=$(hostname -I 2>/dev/null | awk '{print $1}')
-  URL="https://${PUBIP:-127.0.0.1}:${SUB_PORT}${CLASH_PATH%/}/${SUB_ID}"
-  Y=$(curl -sk -m 20 -w '\n%{http_code}' "$URL" 2>/dev/null)
-  CODE=$(printf '%s' "$Y" | tail -n1)
-  BODY=$(printf '%s' "$Y" | sed '$d')
-  if [ "$CODE" != "200" ]; then
-    check subscription "clash endpoint HTTP ${CODE:-no-response} at ${URL}"
-  elif ! printf '%s' "$BODY" | grep -q '^proxies:'; then
-    check subscription "clash endpoint returned no proxies stanza (body: $(printf '%s' "$BODY" | head -c 80))"
+  SUB_TLS=$(dbval subCertFile)
+  SCHEME=$([ -n "$SUB_TLS" ] && echo https || echo http)
+  URL="${SCHEME}://${PUBIP:-127.0.0.1}:${SUB_PORT}${CLASH_PATH%/}/${SUB_ID}"
+  # One verdict, from parsing the profile rather than grepping it: the fleet
+  # publisher puts `proxies` first and a provider block after, so any
+  # line-anchored match is layout-sensitive, and a grep-only probe used to
+  # report FAIL and "ok N node(s)" for the same response.
+  PROBE=$(python3 - "$URL" <<'PYEOF'
+import json, ssl, sys, time, urllib.request
+ctx = ssl.create_default_context()
+ctx.check_hostname = False
+ctx.verify_mode = ssl.CERT_NONE
+err = "no-response"
+body = ""
+for _ in range(6):
+    try:
+        r = urllib.request.Request(sys.argv[1], headers={"User-Agent": "clash/1.18.0"})
+        body = urllib.request.urlopen(r, timeout=20, context=ctx).read().decode("utf-8", "replace")
+        err = ""
+        break
+    except Exception as e:
+        err = str(e)[:70]
+    time.sleep(5)
+if err:
+    print(json.dumps({"fail": "unreachable: %s" % err}))
+    raise SystemExit
+try:
+    import yaml
+except ImportError:
+    print(json.dumps({"nodes": body.count("\n- ")}))
+    raise SystemExit
+doc = yaml.safe_load(body) or {}
+proxies = doc.get("proxies") or []
+providers = list((doc.get("proxy-providers") or {}))
+groups = doc.get("proxy-groups") or []
+names = {p.get("name") for p in proxies} | {g.get("name") for g in groups} \
+        | set(providers) | {"DIRECT", "REJECT", "PASS"}
+out = {"nodes": len(proxies), "groups": len(groups),
+       "providers": ",".join(providers) or "-"}
+loop = [p.get("name") for p in proxies
+        if str(p.get("server", "")).startswith(("127.", "localhost", "::1"))]
+dangling = ["%s->%s" % (g.get("name"), m) for g in groups
+            for m in (g.get("proxies") or []) if m not in names]
+bad_use = [p for g in groups for p in (g.get("use") or []) if p not in providers]
+if loop:
+    out["fail"] = "loopback server in %s" % loop[:4]
+elif dangling:
+    out["fail"] = "dangling members %s" % dangling[:4]
+elif bad_use:
+    out["fail"] = "use() names undeclared provider %s" % bad_use[:4]
+elif not proxies and not providers:
+    out["fail"] = "profile has neither proxies nor providers"
+print(json.dumps(out))
+PYEOF
+)
+  FAIL=$(printf '%s' "$PROBE" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("fail",""))' 2>/dev/null)
+  INFO=$(printf '%s' "$PROBE" | python3 -c 'import json,sys;d=json.load(sys.stdin);print("%s nodes, %s groups, providers=%s"%(d.get("nodes","?"),d.get("groups","?"),d.get("providers","-")))' 2>/dev/null)
+  if [ -n "$FAIL" ]; then
+    check subscription "${INFO}; ${FAIL} at ${URL}"
+  else
+    note "ok    subscription ${INFO} via ${URL}"
   fi
-  printf '%s' "$BODY" | grep -qE '^\s*server:\s*(127\.|localhost)' \
-    && check subscription "node server came back as loopback for Host ${PUBIP}"
-  NODES=$(printf '%s' "$BODY" | grep -c '^  name:' || true)
-  note "ok    subscription ${NODES} node(s) via ${URL}"
 fi
 
 # --- 4. regression guard for the fork's sponsor patch ------------------
