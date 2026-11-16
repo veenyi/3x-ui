@@ -154,20 +154,26 @@ groups = doc.get("proxy-groups") or []
 # a group can embed proxy mappings instead of referencing them by name; those
 # are definitions, and testing a dict for set membership raises TypeError,
 # which used to abort the probe while the script still printed "ok"
-inline = [m for g in groups for m in (g.get("proxies") or []) if isinstance(m, dict)]
-names = ({p.get("name") for p in proxies} | {m.get("name") for m in inline}
+names = ({p.get("name") for p in proxies}
          | {g.get("name") for g in groups}
          | set(providers) | {"DIRECT", "REJECT", "PASS"})
 out = {"nodes": len(proxies), "groups": len(groups),
        "providers": ",".join(providers) or "-"}
 loop = [p.get("name") for p in proxies
         if str(p.get("server", "")).startswith(("127.", "localhost", "::1"))]
+# mihomo requires string members; a mapping here is the client's hard error
+# "proxies[0] expected type 'string'", so treat it as a failure rather than
+# tolerating it
+not_str = ["%s[%d]" % (g.get("name"), i) for g in groups
+           for i, m in enumerate(g.get("proxies") or []) if not isinstance(m, str)]
 dangling = ["%s->%s" % (g.get("name"), m) for g in groups
             for m in (g.get("proxies") or [])
             if isinstance(m, str) and m not in names]
 bad_use = [p for g in groups for p in (g.get("use") or []) if p not in providers]
 if loop:
     out["fail"] = "loopback server in %s" % loop[:4]
+elif not_str:
+    out["fail"] = "group members are not strings %s" % not_str[:4]
 elif dangling:
     out["fail"] = "dangling members %s" % dangling[:4]
 elif bad_use:
