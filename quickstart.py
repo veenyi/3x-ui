@@ -24,6 +24,7 @@ import urllib.request
 DB = "/etc/x-ui/x-ui.db"
 SHORT_IDS = []
 ENV = "/etc/x-ui/install-result.env"
+FLEET_MANIFEST = "/etc/x-ui/fleet.json"
 
 FALLBACK_PORT = 8443
 SERVICE_GROUPS = [
@@ -227,6 +228,77 @@ def build_routing(node_names, region):
     return "\n".join(lines)
 
 
+ACME = "/root/.acme.sh/acme.sh"
+CERT_DIR = "/root/cert/ip"
+
+
+def port_free(p):
+    return (":%d " % p) not in subprocess.run(["ss", "-lnt"], capture_output=True,
+                                              text=True).stdout
+
+
+def converge_tls(R, s):
+    """Issue the 7-day Let's Encrypt IP certificate and wire it to BOTH
+    listeners, then hand back a Runner on the new scheme.
+
+    install.sh honours XUI_SSL_MODE=ip but decides whether to attach the
+    certificate with a bare `read -rp`, so a non-interactive install ends with
+    an HTTP panel and no acme.sh at all -- which is what node 3 came up as. The
+    subscription server is a separate listener and does not inherit the panel
+    certificate, so it is set here too.
+    """
+    if cert_pair(s, "webCertFile", "webKeyFile"):
+        R.note("ok", "panel TLS: %s" % s.get("webCertFile"))
+        return R, s
+    if not port_free(80):
+        R.note("warn", "port 80 busy; cannot HTTP-01 validate, panel stays on HTTP")
+        return R, s
+
+    def do():
+        if not os.path.exists(ACME):
+            subprocess.run("curl -s https://get.acme.sh | sh", shell=True, check=True)
+        if not os.path.exists(ACME):
+            raise RuntimeError("acme.sh still missing after install")
+        ip = os.environ.get("XQS_PUBLIC_IP", "") or detect_public_ip()
+        if not ip:
+            raise RuntimeError("no public IPv4 to issue an IP certificate for")
+        subprocess.run([ACME, "--set-default-ca", "--server", "letsencrypt", "--force"],
+                       capture_output=True, check=False)
+        subprocess.run([ACME, "--issue", "-d", ip, "--standalone", "--server", "letsencrypt",
+                        "--certificate-profile", "shortlived", "--days", "6",
+                        "--httpport", "80", "--force"], check=True)
+        # --installcert will not create its destination directory, and reports
+        # success while leaving the key pair nowhere.
+        os.makedirs(CERT_DIR, exist_ok=True)
+        subprocess.run([ACME, "--installcert", "--force", "-d", ip,
+                        "--key-file", CERT_DIR + "/privkey.pem",
+                        "--fullchain-file", CERT_DIR + "/fullchain.pem",
+                        "--reloadcmd", "systemctl restart x-ui 2>/dev/null || true"], check=False)
+        cert, key = CERT_DIR + "/fullchain.pem", CERT_DIR + "/privkey.pem"
+        if not (os.path.exists(cert) and os.path.exists(key)):
+            raise RuntimeError("acme reported success but no key pair was installed")
+        os.chmod(key, 0o600)
+        st = R.all_settings()
+        st.update({"webCertFile": cert, "webKeyFile": key,
+                   "subCertFile": cert, "subKeyFile": key})
+        R.api("/panel/api/setting/update", st)
+        subprocess.run(["systemctl", "restart", "x-ui"], check=True)
+        R.wait_until_up()
+        subprocess.run([ACME, "--upgrade", "--auto-upgrade"], capture_output=True, check=False)
+
+    try:
+        R.write("issue LE IP certificate + enable TLS (panel and subscription)", do)
+    except Exception as e:
+        R.note("warn", "TLS issuance failed (%s); continuing over HTTP" % str(e)[:90])
+        return R, s
+    if R.dry:
+        return R, s
+    s2 = settings_map()
+    base2 = "%s://127.0.0.1:%s%s" % (scheme_for(s2, "webCertFile", "webKeyFile"),
+                                      s2["webPort"], s2["webBasePath"].rstrip("/"))
+    return Runner(R.dry, base2, R.ctx, R.token), s2
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true")
@@ -252,6 +324,11 @@ def main():
     R = Runner(args.dry_run, base, ctx, env["XUI_API_TOKEN"])
 
     print("== quickstart (%s) on %s ==" % ("dry-run" if args.dry_run else "apply", base))
+
+    # ---- 0. TLS: install.sh leaves the panel on HTTP more often than not ----
+    R, s = converge_tls(R, s)
+    if base != R.base:
+        print("      panel now at %s" % R.base)
 
     # ---- 1. inbounds: primary 443 + fallback -----------------------------
     ins = R.api("/panel/api/inbounds/list").get("obj", [])
@@ -343,7 +420,13 @@ def main():
     # line, never `- name:`
     node_names = [n.strip().strip("'\"") for n in
                   re.findall(r"^\s+name:\s*(.+?)\s*$", text.split("proxy-groups:")[0], re.M)]
-    if len(node_names) < 2:
+    if os.path.exists(FLEET_MANIFEST):
+        # Ownership: on the front node the routing tree carries sibling nodes
+        # and the upstream provider, so writing this box's 2-node tree back
+        # over it would shrink the published fleet on every re-run.
+        R.note("ok", "routing owned by xui-fleet-sync (%s)" % FLEET_MANIFEST)
+        node_names = []
+    elif len(node_names) < 2:
         R.note("warn", "routing skipped: only %d node(s) in the subscription" % len(node_names))
     else:
         remark = list(sqlite3.connect(DB).execute(
@@ -437,17 +520,32 @@ def main():
         R.write("enable looking-glass guard", install_guard)
 
     cron = subprocess.run(["crontab", "-l"], capture_output=True, text=True).stdout
-    for marker, line in (("/usr/local/bin/xui-watchdog", "*/30 * * * * /usr/local/bin/xui-watchdog >/dev/null 2>&1"),
-                         ("/usr/local/bin/xui-backup", "40 3 * * * /usr/local/bin/xui-backup >/dev/null 2>&1")):
+    pending = []
+    wanted = [("/usr/local/bin/xui-watchdog", "*/30 * * * * /usr/local/bin/xui-watchdog >/dev/null 2>&1"),
+              ("/usr/local/bin/xui-backup", "40 3 * * * /usr/local/bin/xui-backup >/dev/null 2>&1")]
+    if os.path.exists(FLEET_MANIFEST):
+        # only the front node has a manifest; scheduling elsewhere would fail
+        wanted.append(("/usr/local/bin/xui-fleet-sync",
+                       "15 */6 * * * /usr/local/bin/xui-fleet-sync >> /var/log/xui-fleet.log 2>&1"))
+    for marker, line in wanted:
         if marker in cron:
             R.note("ok", "cron present: %s" % marker)
         elif os.path.exists(marker):
-            def add_cron(line=line):
-                newcron = "\n".join([cron.rstrip("\n"), line, ""])
-                subprocess.run(["crontab", "-"], input=newcron, text=True, check=True)
-            R.write("schedule %s" % marker, add_cron)
+            pending.append((marker, line))
         else:
             R.note("warn", "%s missing, cannot schedule" % marker)
+    if pending:
+        # One write for every missing entry. Scheduling them inside the loop
+        # from the crontab text captured beforehand meant each `crontab -`
+        # rebuilt the table from the ORIGINAL plus its own one line, silently
+        # deleting the previous addition -- which is why node 2 and node 3 ran
+        # for a day with a backup job and no watchdog.
+        def add_cron(pending=pending, cron=cron):
+            body = cron.rstrip("\n")
+            lines = ([body] if body else []) + [l for _, l in pending]
+            subprocess.run(["crontab", "-"], input="\n".join(lines) + "\n",
+                           text=True, check=True)
+        R.write("schedule " + ", ".join(m for m, _ in pending), add_cron)
 
     # ---- 5. report -------------------------------------------------------
     n_change = sum(1 for k, _ in R.actions if k in ("change", "abort"))
