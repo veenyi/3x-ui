@@ -189,6 +189,32 @@ def read_file(path):
     return open(path, encoding="utf-8").read()
 
 
+def scalar(item, indent="    - "):
+    """Emit one YAML sequence item, quoted exactly as the scalar needs.
+
+    Group members are names, and upstream names contain colons
+    ("Traffic: 31.28 GB | 1000 GB"). Writing those bare makes YAML read them as
+    a mapping, and mihomo then refuses the group:
+    `ProxyGroup 上游订阅: 'proxies[0]' expected type 'string', got unconvertible
+    type 'map[string]interface {}'`.
+    """
+    try:
+        import yaml
+        dumped = yaml.safe_dump(item, default_flow_style=True, width=10 ** 6,
+                                allow_unicode=True)   # keep 中文/emoji readable in the UI
+        # a bare scalar is dumped as `value` plus a `...` document-end marker;
+        # keeping that marker makes the surrounding mapping invalid YAML
+        body = [l for l in dumped.split("\n") if l.strip() not in ("", "...", "---")]
+        return indent + " ".join(body).strip()
+    except Exception:
+        return indent + '"%s"' % str(item).replace("\\", "\\\\").replace('"', '\\"')
+
+
+def name_line(value, indent="- "):
+    """`- name: <value>` with the value quoted only when it needs to be."""
+    return "%sname: %s" % (indent, scalar(value, "").strip())
+
+
 def build_rules(entries, providers, region, up_names=None):
     lines = []
     # A header the panel UI can actually show. The upstream lives only in this
@@ -237,30 +263,28 @@ def build_rules(entries, providers, region, up_names=None):
         # url-test only over our own ports: an upstream ss node on another
         # provider's host would be pinged and rotated by us, and its latency
         # has nothing to do with which of our Reality ports is best
-        groups.append(["- name: LIVE", "  type: url-test", "  proxies:"] +
-                      ["    - %s" % n for n in self_names] +
+        groups.append([name_line("LIVE"), "  type: url-test", "  proxies:"] +
+                      [scalar(n) for n in self_names] +
                       ["  url: http://www.gstatic.com/generate_204",
                        "  interval: 300", "  tolerance: 50", "  lazy: true"])
     if active or up_names:
-        grp = ["- name: 上游订阅", "  type: select"]
+        grp = [name_line("上游订阅"), "  type: select"]
         if active:
-            grp += ["  use:"] + ["    - %s" % p["name"] for p in active]
-        grp += ["  proxies:"] + ["    - %s" % n for n in (up_names or [])]
-        if len(grp) == 3:      # select with neither use nor proxies fails to load
-            groups.append(grp[:2] + ["  proxies:", "    - DIRECT"])
-        else:
-            groups.append(grp)
+            grp += ["  use:"] + [scalar(p["name"]) for p in active]
+        members = [scalar(n) for n in (up_names or [])] or [scalar("DIRECT")]
+        grp += ["  proxies:"] + members
+        groups.append(grp)
     proxy_members = (["LIVE"] if len(self_names) > 1 else []) + self_names + \
                     (["上游订阅"] if (active or up_names) else []) + ["DIRECT"]
-    groups.append(["- name: PROXY", "  type: select", "  proxies:"] +
-                  ["    - %s" % m for m in proxy_members])
-    groups.append(["- name: %s" % region, "  type: select", "  proxies:",
-                   "    - PROXY", "    - DIRECT"])
+    groups.append([name_line("PROXY"), "  type: select", "  proxies:"] +
+                  [scalar(m) for m in proxy_members])
+    groups.append([name_line(region), "  type: select", "  proxies:",
+                   scalar("PROXY"), scalar("DIRECT")])
     for gname, _ in SERVICE_GROUPS:
-        groups.append(["- name: %s" % gname, "  type: select", "  proxies:",
-                       "    - PROXY", "    - %s" % region, "    - DIRECT"])
-    groups.append(["- name: Final", "  type: select", "  proxies:",
-                   "    - PROXY", "    - DIRECT"])
+        groups.append([name_line(gname), "  type: select", "  proxies:",
+                       scalar("PROXY"), scalar(region), scalar("DIRECT")])
+    groups.append([name_line("Final"), "  type: select", "  proxies:",
+                   scalar("PROXY"), scalar("DIRECT")])
     lines.append("proxy-groups:")
     for g in groups:
         lines += g
@@ -291,9 +315,6 @@ def verify(served_text, provider_names):
     defined = {p.get("name") for p in (doc.get("proxies") or [])}
     for g in doc.get("proxy-groups") or []:
         defined.add(g.get("name"))
-        # inline proxy objects inside a group are definitions too, not refs
-        defined.update(m.get("name") for m in (g.get("proxies") or [])
-                       if isinstance(m, dict))
     # members pulled in by `use:` come from providers, resolved at the client
     for g in doc.get("proxy-groups") or []:
         for p in g.get("use") or []:
@@ -301,13 +322,12 @@ def verify(served_text, provider_names):
     defined |= set(provider_names) | {"DIRECT", "REJECT", "PASS"}
     bad = []
     for g in doc.get("proxy-groups") or []:
-        for m in (g.get("proxies") or []):
-            # the panel embeds some proxies inline as mappings; only a string
-            # member is a reference that can dangle
-            if isinstance(m, dict):
-                defined.add(m.get("name"))
-                continue
-            if m not in defined:
+        for i, m in enumerate(g.get("proxies") or []):
+            if not isinstance(m, str):
+                # mihomo: "proxies[i] expected type 'string'" -- a colon-bearing
+                # name emitted bare turns into a mapping and breaks the load
+                bad.append("%s[%d] not a string" % (g.get("name"), i))
+            elif m not in defined:
                 bad.append("%s->%s" % (g.get("name"), m))
     n = len(doc.get("proxies") or [])
     note("ok    served %d proxy(ies), %d group(s), %d provider(s)"
@@ -377,6 +397,16 @@ def main():
         if n_prox != len(entries):
             note("abort %d entries built but only %d proxies parsed; refusing to publish"
                  % (len(entries), n_prox))
+            return 2
+        # mihomo requires every group member to be a string; a colon-bearing
+        # name written bare becomes a mapping and the client rejects the group
+        # outright, so catch it here instead of shipping a broken profile.
+        non_str = ["%s[%d]" % (g.get("name"), i)
+                   for g in (parsed or {}).get("proxy-groups") or []
+                   for i, m in enumerate(g.get("proxies") or [])
+                   if not isinstance(m, str)]
+        if non_str:
+            note("abort group members are not strings: %s" % non_str[:5])
             return 2
     except ImportError:
         pass
