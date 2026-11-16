@@ -1,0 +1,320 @@
+#!/usr/bin/env python3
+"""xui-fleet — merge 自建节点 (our own 3x-ui panels) with 订阅节点 (an upstream
+clash config) into one OpenClash/FlClash-ready profile.
+
+Two update planes, deliberately separate:
+
+  * self-built nodes are re-read from each panel over SSH and can also be
+    expressed as mihomo `proxy-providers`, so the router refreshes them itself;
+  * the upstream subscription is only updatable if we hold its *link*, not an
+    exported yaml. `upstream.url` enables provider mode; `upstream.file` falls
+    back to inline nodes that a re-run refreshes from disk.
+
+Why nodes are injected into the upstream's own groups instead of rebuilding
+rules: an exported clash profile carries thousands of hand-tuned rules whose
+group names must keep existing. Deleting them silently makes everything fall
+through to Final.
+
+Secrets never enter the repo: the manifest, the upstream file and every output
+live outside the source tree (chmod 600).
+"""
+import argparse
+import base64
+import json
+import os
+import re
+import sys
+
+try:
+    import yaml
+except ImportError:
+    sys.exit("pip install pyyaml")
+
+try:
+    import paramiko
+except ImportError:
+    paramiko = None
+
+READ_SUB = r'''
+import sqlite3, ssl, urllib.request
+c = sqlite3.connect("/etc/x-ui/x-ui.db")
+d = dict((str(k), str(v)) for k, v in c.execute("select key,value from settings"))
+sub = list(c.execute("select sub_id from clients where enable=1 limit 1"))[0][0]
+PUBIP = "__IP__"
+PUBPORT = __SUBPORT__
+scheme = "https" if d.get("subCertFile") else "http"
+ctx = ssl.create_default_context()
+ctx.check_hostname = False
+ctx.verify_mode = ssl.CERT_NONE
+def grab(path):
+    # The panel renders the server field from the request Host. Addressing
+    # 127.0.0.1 without overriding it produced `server: localhost` in every
+    # merged node, which is unusable off that box.
+    url = scheme + "://127.0.0.1:" + str(d["subPort"]) + path + sub
+    r = urllib.request.Request(url)
+    r.add_header("Host", PUBIP + ":" + str(PUBPORT))
+    r.add_header("User-Agent", "v2rayNG/1.8.5")
+    return urllib.request.urlopen(r, timeout=30, context=ctx).read().decode("utf-8")
+print("=CLASH="); print(grab(d["subClashPath"]))
+print("=LINKS="); print(grab(d["subPath"]))
+'''
+
+
+def _fetch_http(url, ua="clash/1.18.0"):
+    import urllib.request
+    req = urllib.request.Request(url, headers={"User-Agent": ua})
+    return urllib.request.urlopen(req, timeout=30).read().decode("utf-8")
+
+
+PROVIDER_UA = "clash/1.18.0"
+
+
+def provider_block(url, path, interval=86400):
+    """OpenClash/mihomo fetches this itself, on the client's network.
+
+    The UA has to be declared: the upstream answers 403 for v2rayNG-style
+    agents and 200 for a clash agent, and a provider that cannot set its agent
+    would never refresh.
+    """
+    return {"type": "http", "url": url, "interval": interval, "path": path,
+            "header": {"User-Agent": PROVIDER_UA},
+            "healthCheck": {"enable": True, "url": "http://www.gstatic.com/generate_204",
+                            "interval": 600, "timeout": 5}}
+
+
+def fetch_sub(node):
+    """Return (clash_text, links_text) for one self-built node.
+
+    Over SSH when the panel's sub port is not reachable from here -- node 3's
+    provider passes only 22/443 inbound, so 2096 silently times out.
+    """
+    if node.get("url"):
+        import urllib.request
+        req = urllib.request.Request(node["url"], headers={"User-Agent": "clash"})
+        return urllib.request.urlopen(req, timeout=30).read().decode("utf-8"), ""
+    script = READ_SUB.replace("__IP__", node["public_ip"]).replace(
+        "__SUBPORT__", str(node["ssh"].get("sub_port", 2096)))
+    if not paramiko:
+        raise RuntimeError("node %s needs ssh but paramiko is missing" % node["name"])
+    cli = paramiko.SSHClient()
+    cli.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    cli.connect(node["ssh"]["host"], port=node["ssh"].get("port", 22),
+                username=node["ssh"].get("user", "root"),
+                password=node["ssh"].get("password"), timeout=30)
+    try:
+        chan = cli.get_transport().open_session(timeout=90)
+        chan.settimeout(90)
+        chan.exec_command("python3 - <<'PYEOF'\n%s\nPYEOF" % script)
+        chunks = []
+        while True:
+            try:
+                data = chan.recv(65536)
+            except Exception:
+                break
+            if not data:
+                break
+            chunks.append(data)
+        out = b"".join(chunks)
+        err = chan.recv_stderr(4096).decode("utf-8", "replace")
+        if chan.recv_exit_status() != 0 and not out:
+            raise RuntimeError("node %s: %s" % (node["name"], err[:200]))
+    finally:
+        cli.close()
+    text = out.decode("utf-8")
+    clash = text.split("=LINKS=")[0].replace("=CLASH=", "", 1).strip()
+    links = text.split("=LINKS=")[-1].strip()
+    if not clash.startswith("proxies") and "proxy-groups" not in clash:
+        raise RuntimeError("node %s returned no clash text: %r" % (node["name"], clash[:120]))
+    return clash, links
+
+
+def proxies_of(text):
+    doc = yaml.safe_load(text)
+    return doc.get("proxies") or []
+
+
+def decode_links(text):
+    """A panel's link subscription is base64 of newline-separated URIs. Use it
+    verbatim: hand-rebuilding vless:// from clash dicts produced
+    `reality-opts={'public-key'...}` Python reprs instead of a real URL."""
+    body = text.strip()
+    try:
+        body = base64.b64decode(body + "===", ).decode("utf-8")
+    except Exception:
+        pass
+    return [l for l in body.split("\n") if l.strip()]
+
+
+def dedupe(names_taken, proxies, prefix):
+    """Panel B and panel C often remark the same 'Reality-443'; a duplicate
+    name inside one clash config makes mihomo refuse the whole profile."""
+    out = []
+    for p in proxies:
+        n = p.get("name") or ""
+        if n in names_taken:
+            p = dict(p)
+            p["name"] = "%s%s" % (prefix, n)
+        names_taken.add(p["name"])
+        out.append(p)
+    return out
+
+
+def build(manifest):
+    taken, self_nodes, self_links, providers = set(), [], [], {}
+    for node in manifest["self_built"]:
+        text, links = fetch_sub(node)
+        self_nodes += dedupe(taken, proxies_of(text), node["name"] + " ")
+        self_links += decode_links(links)
+        if node.get("provider_url"):
+            providers[node["name"]] = provider_block(
+                node["provider_url"], "./proxy_provider/%s.yaml" % node["name"])
+
+    if manifest["upstream"].get("url"):
+        try:
+            up_text = _fetch_http(manifest["upstream"]["url"])
+        except Exception as e:
+            # The upstream fences its endpoint twice over: a clash user agent
+            # gets 200 while v2rayNG gets 403, and an overseas VPS gets 403 for
+            # every agent. The exported profile is the same bytes, so fall back
+            # to it for the inline copy and still declare the provider -- the
+            # router fetches from inside the allowed region and stays fresh.
+            fb = manifest["upstream"].get("file")
+            if not fb:
+                raise
+            print("  note: upstream url not fetchable here (%s); using %s for the "
+                  "inline copy, provider still declared for client-side refresh"
+                  % (str(e)[:60], os.path.basename(fb)))
+            up_text = open(fb, encoding="utf-8").read()
+        upstream = yaml.safe_load(up_text)
+        up_proxies = dedupe(taken, proxies_of(up_text), "up ")
+        providers["upstream"] = provider_block(manifest["upstream"]["url"],
+                                              "./proxy_provider/upstream.yaml", 3600)
+    else:
+        path = manifest["upstream"]["file"]
+        raw = open(path, encoding="utf-8").read()
+        upstream = yaml.safe_load(raw)
+        up_proxies = dedupe(taken, upstream.get("proxies") or [], "up ")
+
+    up_groups = upstream.get("proxy-groups") or []
+    up_rules = upstream.get("rules") or []
+
+    # 自建 becomes its own selectable branch, and the upstream's entry group
+    # gains it as a member so existing bookmarks/rules keep working.
+    live_name = "LIVE-selfbuilt"
+    groups = []
+    if len(self_nodes) > 1:
+        groups.append({"name": live_name, "type": "url-test",
+                       "proxies": [p["name"] for p in self_nodes],
+                       "url": "http://www.gstatic.com/generate_204",
+                       "interval": 300, "tolerance": 50, "lazy": True})
+    groups.append({"name": "自建节点", "type": "select",
+                   "proxies": ([live_name] if self_nodes else []) + [p["name"] for p in self_nodes]})
+    if up_proxies:
+        groups.append({"name": "订阅节点", "type": "select",
+                       "proxies": [p["name"] for p in up_proxies]})
+
+    injected = 0
+    for g in up_groups:
+        if g.get("name") == manifest.get("entry_group", "Proxies"):
+            add = ["自建节点"] + (["订阅节点"] if up_proxies else [])
+            g.setdefault("proxies", [])
+            g["proxies"] = [x for x in add if x not in g["proxies"]] + g["proxies"]
+            injected += len(add)
+    groups.extend(up_groups)
+
+    # every group member must exist: drop names nothing defines, else mihomo
+    # fails the load with "dial name ... not found"
+    defined = {p["name"] for p in self_nodes + up_proxies} | {g["name"] for g in groups}
+    for g in groups:
+        g["proxies"] = [p for p in g.get("proxies", []) if p in defined]
+
+    doc = {
+        "port": upstream.get("port", 7890),
+        "socks-port": upstream.get("socks-port", 7891),
+        "mixed-port": upstream.get("mixed-port", 7893),
+        "allow-lan": upstream.get("allow-lan", False),
+        "mode": "rule",
+        "log-level": "info",
+        "unified-delay": True,
+        "ipv6": upstream.get("ipv6", False),
+        "external-controller": upstream.get("external-controller", "127.0.0.1:9090"),
+        "dns": upstream.get("dns"),
+        "sniffer": upstream.get("sniffer"),
+        "profile": upstream.get("profile", {"store-selected": True}),
+        "proxy-providers": providers or None,
+        "proxies": self_nodes + up_proxies,
+        "proxy-groups": groups,
+        "rules": up_rules,
+    }
+    doc = {k: v for k, v in doc.items() if v not in (None, {}, [])}
+    return doc, {"self": len(self_nodes), "upstream": len(up_proxies),
+                 "groups": len(groups), "rules": len(up_rules),
+                 "providers": len(providers), "entry_injected": injected,
+                 "panel_links": len(self_links)}, self_links
+
+
+def links_of(proxies, skip_names=frozenset()):
+    """Link form for nodes that have no panel to ask (the upstream's ss nodes).
+
+    vless/reality is deliberately absent: the panels already emit exact
+    reality links, and re-deriving them here from clash dicts mangled
+    reality-opts into a Python repr.
+    """
+    out = []
+    for p in proxies:
+        if p.get("name") in skip_names:
+            continue
+        if p.get("type") == "ss":
+            cred = base64.b64encode(("%s:%s" % (p["cipher"], p["password"])).encode()).decode()
+            s = "ss://%s@%s:%s" % (cred, p["server"], p["port"])
+            if p.get("plugin") == "obfs":
+                opts = p.get("plugin-opts") or {}
+                s += "?plugin=obfs-local%%3Bobfs%%3D%s%%3Bobfs-host%%3D%s" % (
+                    opts.get("mode", "http"), opts.get("host", ""))
+            out.append("%s#%s" % (s, base64.b64encode(p["name"].encode()).decode()))
+        elif p.get("type") not in ("vless", "trojan"):
+            print("  note: no link form for type=%s (%s)" % (p.get("type"), p.get("name")))
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--manifest", required=True)
+    ap.add_argument("--out", required=True, help="merged clash yaml")
+    ap.add_argument("--links", default=None, help="optional base64 link subscription")
+    args = ap.parse_args()
+
+    os.umask(0o077)          # the output carries the upstream password
+    manifest = json.load(open(args.manifest, encoding="utf-8"))
+    doc, stats, self_links = build(manifest)
+    with open(args.out, "w", encoding="utf-8") as f:
+        yaml.safe_dump(doc, f, allow_unicode=True, sort_keys=False, width=1000)
+    print("merged: %d self-built + %d upstream proxies, %d groups, %d rules, "
+          "%d providers, %d injected into entry group" %
+          (stats["self"], stats["upstream"], stats["groups"], stats["rules"],
+           stats["providers"], stats["entry_injected"]))
+    print("wrote %s (%d bytes)" % (args.out, os.path.getsize(args.out)))
+    if args.links:
+        panel_names = {p["name"] for p in doc["proxies"] if p.get("type") == "vless"}
+        body = self_links + links_of(doc["proxies"], skip_names=panel_names)
+        with open(args.links, "w", encoding="utf-8") as f:
+            f.write(base64.b64encode("\n".join(body).encode()).decode())
+        print("wrote %s (%d links: %d from panels, %d synthesized)" %
+              (args.links, len(body), len(self_links), len(body) - len(self_links)))
+
+    # prove it is loadable rather than merely writable
+    reloaded = yaml.safe_load(open(args.out, encoding="utf-8"))
+    names = {p["name"] for p in reloaded.get("proxies", [])} | \
+            {g["name"] for g in reloaded.get("proxy-groups", [])}
+    dangling = {m for g in reloaded.get("proxy-groups", []) for m in g.get("proxies", [])
+                if m not in names}
+    print("verify: groups=%d refs-intact=%s rules=%d" %
+          (len(reloaded.get("proxy-groups", [])), not dangling,
+           len(reloaded.get("rules", []))))
+    if dangling:
+        print("  DANGLING: %s" % sorted(dangling)[:10])
+        return 1
+    return 0
+
+
+main()
