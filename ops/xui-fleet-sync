@@ -144,7 +144,19 @@ def proxy_blocks(text):
 
 
 def build_rules(entries, providers, region):
-    lines = ["proxies:"]
+    lines = []
+    # A header the panel UI can actually show. The upstream lives only in this
+    # text blob -- the panel's own "outbound subscriptions" list is unusable for
+    # it because that feature fetches server-side and the provider geo-fences
+    # its endpoint -- so without these lines the URL is invisible to anyone who
+    # opens 面板设置 → 订阅设置 → Clash 自定义规则.
+    lines.append("# 由 xui-fleet-sync 生成，请勿手改（下次同步会覆盖）。")
+    lines.append("# 自建节点已内联在下方 proxies:；上游订阅由客户端自行拉取"
+                 "（服务端拉必然 403：提供方按地区拦截）。")
+    for p in providers:
+        lines.append("# 上游 %-10s 刷新 %ss  url: %s"
+                     % (p["name"], p.get("interval", 3600), p["url"]))
+    lines.append("proxies:")
     lines += [e["block"] for e in entries]
 
     if providers:
