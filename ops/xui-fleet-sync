@@ -1,0 +1,327 @@
+#!/usr/bin/env python3
+"""xui-fleet-sync — make THIS panel's clash subscription carry the whole fleet.
+
+Run it on the front node (cron: every 6 hours). Each source is read by
+whichever transport actually reaches it:
+
+  local   the panel's own subscription over 127.0.0.1
+  url     a sibling panel's subscription port, when it is reachable
+  ssh     a forced, read-only subscription reader -- required for hosts whose
+          provider filters every inbound port but 22/443, where :2096 is dark
+
+Two things this has to get right, and neither is obvious from the panel UI:
+
+1. mergeClashRulesYAML merges only `rules` and ASSIGNS every other top-level
+   key over the generated config. So `proxies` must be restated in full (own
+   nodes included) and every group member must actually be defined, or mihomo
+   refuses the profile with "dial name ... not found".
+2. Sibling panels collide: two freshly quickstarted boxes both name their
+   fallback "Reality-443 [fallback 8443]". Names are labels, so the loser gets
+   prefixed by its source; keys and ports stay untouched.
+
+The upstream subscription is declared as a proxy-provider, not copied: its
+endpoint answers 403 to overseas IPs, so the VPS can never fetch it, while a
+mihomo client on the user's own network can -- which is how OpenClash keeps
+providers fresh without the server being able to reach them.
+"""
+import argparse
+import json
+import re
+import ssl
+import subprocess
+import sys
+import time
+import urllib.request
+
+DB = "/etc/x-ui/x-ui.db"
+MANIFEST = "/etc/x-ui/fleet.json"
+LOG = "/var/log/xui-fleet.log"
+
+SERVICE_GROUPS = [
+    ("OpenAI", ["openai.com", "chatgpt.com", "oaistatic.com",
+                "oaiusercontent.com", "anthropic.com", "claude.ai"]),
+    ("Google", ["google.com", "googleapis.com", "gstatic.com",
+                "googleusercontent.com"]),
+    ("YouTube", ["youtube.com", "youtu.be", "ytimg.com", "googlevideo.com"]),
+    ("Telegram", ["telegram.org", "t.me", "telegram.me"]),
+    ("Streaming", ["netflix.com", "nflxvideo.net", "disneyplus.com",
+                   "spotify.com", "twitch.tv"]),
+    ("AI", ["copilot.microsoft.com", "gemini.google.com", "perplexity.ai"]),
+]
+
+
+def note(msg):
+    line = "%s %s" % (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), msg)
+    print(line)
+    try:
+        with open(LOG, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
+
+
+def ctx_noverify():
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
+def detect_public_ip():
+    for probe in ("https://api.ipify.org", "https://ifconfig.me/ip"):
+        try:
+            return urllib.request.urlopen(probe, timeout=10).read().decode().strip()
+        except Exception:
+            continue
+    return ""
+
+
+def read_local(retries=8):
+    """Own subscription, addressed by public IP so `server:` is not localhost.
+
+    A restart brings the panel listener up first and the subscription listener
+    seconds later; reading immediately produced "connection refused" and left
+    the settings written but unverified.
+    """
+    import sqlite3
+    c = sqlite3.connect(DB)
+    d = dict((str(k), str(v)) for k, v in c.execute("select key,value from settings"))
+    sub = list(c.execute("select sub_id from clients where enable=1 limit 1"))[0][0]
+    scheme = "https" if d.get("subCertFile") else "http"
+    url = "%s://127.0.0.1:%s%s%s" % (scheme, d["subPort"], d["subClashPath"], sub)
+    last = None
+    for _ in range(retries):
+        try:
+            r = urllib.request.Request(url)
+            r.add_header("Host", "%s:%s" % (detect_public_ip(), d["subPort"]))
+            r.add_header("User-Agent", "clash/1.18.0")
+            return urllib.request.urlopen(r, timeout=30, context=ctx_noverify()).read().decode("utf-8")
+        except Exception as e:
+            last = e
+            time.sleep(3)
+    raise RuntimeError("subscription not served yet: %s" % last)
+
+
+def read_url(url):
+    r = urllib.request.Request(url, headers={"User-Agent": "clash/1.18.0"})
+    return urllib.request.urlopen(r, timeout=30, context=ctx_noverify()).read().decode("utf-8")
+
+
+def read_ssh(src):
+    """Forced-command reader; the remote end ignores argv, so nothing else can
+    be asked of it."""
+    cmd = ["ssh", "-i", src["key"], "-o", "BatchMode=yes",
+           "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=15",
+           "-p", str(src.get("port", 22)), "%s@%s" % (src.get("user", "root"), src["host"])]
+    out = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+    if "=CLASH=" not in out.stdout:
+        raise RuntimeError("ssh %s: %s" % (src["host"], (out.stderr or out.stdout)[:150]))
+    return out.stdout.split("=CLASH=")[-1].split("=LINKS=")[0]
+
+
+def name_of(block):
+    m = re.search(r"(?m)^\s*name:\s*(.+?)\s*$", block)
+    return m.group(1).strip().strip("'\"") if m else None
+
+
+def set_name(block, new):
+    return re.sub(r"(?m)^(\s*name:).*$", r"\g<1> %s" % new, block, count=1)
+
+
+def proxy_blocks(text):
+    """Every `- ` item of the proxies section, kept as its own YAML block.
+
+    3x-ui writes clash proxies in block style sorted by key, so a proxy always
+    begins at column 0 with `- ` and the next one does too.
+    """
+    head = text.split("proxy-groups:")[0].split("proxies:", 1)[-1]
+    blocks = []
+    for b in re.split(r"\n(?=- )", "\n" + head.strip()):
+        b = b.strip("\n")
+        if b.startswith("- ") and name_of(b) and "server:" in b:
+            blocks.append(b)
+    return blocks
+
+
+def build_rules(entries, providers, region):
+    lines = ["proxies:"]
+    lines += [e["block"] for e in entries]
+
+    if providers:
+        lines.append("proxy-providers:")
+        for p in providers:
+            lines += ["  %s:" % p["name"],
+                      "    type: http",
+                      "    url: %s" % p["url"],
+                      "    interval: %d" % p.get("interval", 3600),
+                      "    path: ./proxy_provider/%s.yaml" % p["name"],
+                      "    format: yaml",
+                      "    header:",
+                      "      User-Agent: clash/1.18.0",
+                      "    health-check:",
+                      "      enable: true",
+                      "      url: http://www.gstatic.com/generate_204",
+                      "      interval: 600",
+                      "      timeout: 5"]
+
+    names = [e["name"] for e in entries]
+    groups = []
+    if len(names) > 1:
+        groups.append(["- name: LIVE", "  type: url-test", "  proxies:"] +
+                      ["    - %s" % n for n in names] +
+                      ["  url: http://www.gstatic.com/generate_204",
+                       "  interval: 300", "  tolerance: 50", "  lazy: true"])
+    if providers:
+        groups.append(["- name: 上游订阅", "  type: select", "  use:"] +
+                      ["    - %s" % p["name"] for p in providers])
+    proxy_members = (["LIVE"] if len(names) > 1 else []) + names + \
+                    (["上游订阅"] if providers else []) + ["DIRECT"]
+    groups.append(["- name: PROXY", "  type: select", "  proxies:"] +
+                  ["    - %s" % m for m in proxy_members])
+    groups.append(["- name: %s" % region, "  type: select", "  proxies:",
+                   "    - PROXY", "    - DIRECT"])
+    for gname, _ in SERVICE_GROUPS:
+        groups.append(["- name: %s" % gname, "  type: select", "  proxies:",
+                       "    - PROXY", "    - %s" % region, "    - DIRECT"])
+    groups.append(["- name: Final", "  type: select", "  proxies:",
+                   "    - PROXY", "    - DIRECT"])
+    lines.append("proxy-groups:")
+    for g in groups:
+        lines += g
+
+    rules = []
+    for gname, domains in SERVICE_GROUPS:
+        rules += ["- DOMAIN-SUFFIX,%s,%s" % (d, gname) for d in domains]
+    rules += ["- DOMAIN-SUFFIX,github.com,PROXY", "- DOMAIN-SUFFIX,githubusercontent.com,PROXY",
+              "- DOMAIN-SUFFIX,wikipedia.org,PROXY", "- DOMAIN-SUFFIX,x.com,PROXY",
+              "- DOMAIN-SUFFIX,twitter.com,PROXY", "- DOMAIN-SUFFIX,discord.com,PROXY",
+              "- DOMAIN-SUFFIX,discordapp.net,PROXY", "- GEOIP,CN,DIRECT", "- MATCH,Final"]
+    lines.append("rules:")
+    lines += rules
+    return "\n".join(lines) + "\n"
+
+
+def verify(served_text, provider_names):
+    """Return group members that resolve to nothing.
+
+    Parsing beats regex: the fork writes url-test groups as a sequence of
+    mappings, so a line-based scan mistook `interval: 300` for a node name.
+    """
+    try:
+        import yaml
+    except ImportError:
+        return []
+    doc = yaml.safe_load(served_text)
+    defined = {p.get("name") for p in (doc.get("proxies") or [])}
+    for g in doc.get("proxy-groups") or []:
+        defined.add(g.get("name"))
+    # members pulled in by `use:` come from providers, resolved at the client
+    for g in doc.get("proxy-groups") or []:
+        for p in g.get("use") or []:
+            defined.add(p)
+    defined |= set(provider_names) | {"DIRECT", "REJECT", "PASS"}
+    bad = []
+    for g in doc.get("proxy-groups") or []:
+        for m in (g.get("proxies") or []):
+            if m not in defined:
+                bad.append("%s->%s" % (g.get("name"), m))
+    n = len(doc.get("proxies") or [])
+    note("ok    served %d proxy(ies), %d group(s), %d provider(s)"
+         % (n, len(doc.get("proxy-groups") or []), len(doc.get("proxy-providers") or {})))
+    return bad
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--manifest", default=MANIFEST)
+    args = ap.parse_args()
+
+    man = json.load(open(args.manifest, encoding="utf-8"))
+    entries, taken = [], set()
+    for src in man["sources"]:
+        try:
+            reader = {"local": read_local, "url": lambda: read_url(src["url"]),
+                      "ssh": lambda: read_ssh(src)}[src["kind"]]
+            text = reader()
+        except KeyError:
+            note("warn  %-10s unknown kind %r" % (src["name"], src["kind"]))
+            continue
+        except Exception as e:
+            note("warn  %-10s skipped: %s" % (src["name"], str(e)[:90]))
+            continue
+        blocks = proxy_blocks(text)
+        # Ownership filter. Without it the front node reads back the siblings
+        # it published into its own subscription last run and re-adds them with
+        # a prefix, so the node list doubles every execution (6 -> 10 -> ...).
+        own = src.get("ip") or (detect_public_ip() if src["kind"] == "local" else "")
+        if own:
+            mine = [b for b in blocks
+                    if re.search(r"(?m)^\s*server:\s*[\"']?%s\s*$" % re.escape(own), b)]
+            if mine:
+                if len(mine) != len(blocks):
+                    note("ok    %-10s dropped %d foreign node(s) it published earlier"
+                         % (src["name"], len(blocks) - len(mine)))
+                blocks = mine
+        for blk in blocks:
+            nm = name_of(blk)
+            if not nm:
+                continue
+            if nm in taken:
+                nm = "%s %s" % (src["name"], nm)
+            taken.add(nm)
+            entries.append({"name": nm, "block": set_name(blk, nm)})
+        note("ok    %-10s %d node(s) via %s" % (src["name"], len(blocks), src["kind"]))
+
+    rules = build_rules(entries, man.get("providers", []), man.get("region", "自建"))
+
+    import sqlite3
+    c = sqlite3.connect(DB)
+    d = dict((str(k), str(v)) for k, v in c.execute("select key,value from settings"))
+    base = "%s://127.0.0.1:%s%s" % ("https" if d.get("webCertFile") else "http",
+                                    d["webPort"], d["webBasePath"].rstrip("/"))
+    tok = [l.split("=", 1)[1].strip() for l in open("/etc/x-ui/install-result.env")
+           if l.startswith("XUI_API_TOKEN")][0]
+
+    def api(path, data=None):
+        body = json.dumps(data).encode() if data is not None else None
+        r = urllib.request.Request(base + path, data=body,
+                                   method="POST" if body is not None else "GET")
+        r.add_header("Authorization", "Bearer " + tok)
+        r.add_header("Content-Type", "application/json")
+        with urllib.request.urlopen(r, timeout=90, context=ctx_noverify()) as x:
+            return json.loads(x.read())
+
+    eff = api("/panel/api/setting/all", {})["obj"]
+    if (eff.get("subClashRules") or "").strip() == rules.strip():
+        note("ok    fleet already published (%d nodes, %d providers)"
+             % (len(entries), len(man.get("providers", []))))
+        return 0
+    if args.dry_run:
+        print(rules)
+        note("would publish %d nodes, %d providers (%d bytes)"
+             % (len(entries), len(man.get("providers", [])), len(rules)))
+        return 0
+
+    eff["subClashEnableRouting"] = True
+    eff["subClashRules"] = rules
+    api("/panel/api/setting/update", eff)
+    subprocess.run(["systemctl", "restart", "x-ui"], check=True)
+    for _ in range(30):
+        try:
+            urllib.request.urlopen(urllib.request.Request(base), timeout=5,
+                                   context=ctx_noverify()).read()
+            break
+        except Exception:
+            time.sleep(2)
+
+    served = read_local()
+    dangling = verify(served, [p["name"] for p in man.get("providers", [])])
+    note("change published: providers=%s, dangling=%s"
+         % (",".join(p["name"] for p in man.get("providers", [])) or "-",
+            dangling or "none"))
+    return 1 if dangling else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
