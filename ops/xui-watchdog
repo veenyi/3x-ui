@@ -71,6 +71,38 @@ for p in $INBOUND_PORTS; do
   ss -lnt 2>/dev/null | grep -q ":$p " || check inbound "inbound port $p is enabled in the DB but not listening"
 done
 
+# --- 2b. the reality handshake target is still handshakeable --------------
+# When the destination site stops offering TLS1.3 with an X25519 group, xray
+# keeps listening and behaves normally to the panel while every client fails
+# the handshake. That looks exactly like our own outage, so check the target.
+TARGETS=$(python3 -c "
+import json, sqlite3
+seen, out = set(), []
+for (ss,) in sqlite3.connect('$DB').execute('select stream_settings from inbounds where enable=1'):
+    try:
+        d = json.loads(ss or '{}')
+    except Exception:
+        continue
+    # the column holds the streamSettings object itself, but an inbound saved
+    # through the API can arrive wrapped; accept both shapes
+    for cand in (d, d.get('streamSettings') or {}):
+        rs = (cand or {}).get('realitySettings') or {}
+        t = rs.get('target')
+        if t and ':' in t and t not in seen:
+            seen.add(t); out.append(t)
+print(' '.join(out))
+")
+for t in $TARGETS; do
+  h=${t%%:*}; p=${t##*:}
+  case "$p" in *[!0-9]*) p=443 ;; esac
+  if ! echo | timeout 15 openssl s_client -connect "$h:$p" -servername "$h" -tls1_3 2>&1 \
+       | grep -qiE 'TLS1\.3 group:.*X25519|Protocol: TLSv1\.3'; then
+    check reality_target "$t no longer completes a TLS1.3/X25519 handshake; clients will fail"
+  else
+    note "ok    reality target $t still handshakes"
+  fi
+done
+
 # --- 3. subscription actually yields a usable node ----------------------
 SUB_ID=$(python3 -c "
 import sqlite3
@@ -119,14 +151,20 @@ doc = yaml.safe_load(body) or {}
 proxies = doc.get("proxies") or []
 providers = list((doc.get("proxy-providers") or {}))
 groups = doc.get("proxy-groups") or []
-names = {p.get("name") for p in proxies} | {g.get("name") for g in groups} \
-        | set(providers) | {"DIRECT", "REJECT", "PASS"}
+# a group can embed proxy mappings instead of referencing them by name; those
+# are definitions, and testing a dict for set membership raises TypeError,
+# which used to abort the probe while the script still printed "ok"
+inline = [m for g in groups for m in (g.get("proxies") or []) if isinstance(m, dict)]
+names = ({p.get("name") for p in proxies} | {m.get("name") for m in inline}
+         | {g.get("name") for g in groups}
+         | set(providers) | {"DIRECT", "REJECT", "PASS"})
 out = {"nodes": len(proxies), "groups": len(groups),
        "providers": ",".join(providers) or "-"}
 loop = [p.get("name") for p in proxies
         if str(p.get("server", "")).startswith(("127.", "localhost", "::1"))]
 dangling = ["%s->%s" % (g.get("name"), m) for g in groups
-            for m in (g.get("proxies") or []) if m not in names]
+            for m in (g.get("proxies") or [])
+            if isinstance(m, str) and m not in names]
 bad_use = [p for g in groups for p in (g.get("use") or []) if p not in providers]
 if loop:
     out["fail"] = "loopback server in %s" % loop[:4]
