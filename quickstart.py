@@ -136,6 +136,19 @@ def gen_reality_keys():
     return priv, pub, ids
 
 
+def cert_pair(d, cert_key, key_key):
+    """A panel/subscription listener speaks TLS only when BOTH paths are set.
+    A box can legitimately come up on plain HTTP: some providers filter every
+    inbound port but 22/443, so acme HTTP-01 never validates and install.sh
+    leaves webCertFile empty. Hardcoding https:// then died with
+    WRONG_VERSION_NUMBER on exactly that box."""
+    return bool(str(d.get(cert_key) or "").strip()) and bool(str(d.get(key_key) or "").strip())
+
+
+def scheme_for(d, cert_key, key_key):
+    return "https" if cert_pair(d, cert_key, key_key) else "http"
+
+
 def port_of(target):
     return target.rsplit(":", 1)[1] if ":" in target else "443"
 
@@ -230,7 +243,8 @@ def main():
     # panel, so the live values come from the settings table.
     # webBasePath ends with "/", API paths start with "/": joining them raw
     # yields a double slash and the panel answers 404.
-    base = "https://127.0.0.1:%s%s" % (s["webPort"], s["webBasePath"].rstrip("/"))
+    base = "%s://127.0.0.1:%s%s" % (scheme_for(s, "webCertFile", "webKeyFile"),
+                                     s["webPort"], s["webBasePath"].rstrip("/"))
     assert "//panel" not in base + "/panel/api/x"
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
@@ -285,11 +299,19 @@ def main():
     # subClashPath row in the settings table at all, since those defaults live in
     # code. Reading the DB directly raised KeyError on the second node.
     eff = R.all_settings()
-    want = {"subEnable": True, "subClashEnable": True, "subClashEnableRouting": True}
+    want = {"subEnable": True, "subClashEnable": True, "subClashEnableRouting": True,
+            # Fleet aggregation pulls each other's *link* subscription; without
+            # json+plain enabled a remote panel gets 0 outbounds and no error.
+            "subJsonEnable": True}
     changed = {}
     for k, v in want.items():
         if str(eff.get(k, "")).lower() != "true":
             changed[k] = v
+    # The subscription listener is a separate server: it does not inherit the
+    # panel certificate, and leaving its paths empty silently serves HTTP.
+    if cert_pair(eff, "webCertFile", "webKeyFile") and not cert_pair(eff, "subCertFile", "subKeyFile"):
+        changed["subCertFile"] = eff.get("webCertFile")
+        changed["subKeyFile"] = eff.get("webKeyFile")
     if changed:
         allsettings = dict(eff)
         allsettings.update(changed)
@@ -313,7 +335,8 @@ def main():
         R.note("warn", "no enabled client; create one in the panel then re-run")
         return 2
     sub_id = rows[0][0]
-    url = "https://127.0.0.1:%s%s%s" % (eff["subPort"], eff["subClashPath"], sub_id)
+    url = "%s://127.0.0.1:%s%s%s" % (scheme_for(eff, "subCertFile", "subKeyFile"),
+                                      eff["subPort"], eff["subClashPath"], sub_id)
     text = urllib.request.urlopen(urllib.request.Request(url), timeout=30,
                                   context=ctx).read().decode()
     # clash emits each proxy with keys sorted, so `name:` is an indented plain
@@ -431,8 +454,8 @@ def main():
     print("\n== summary: %d action(s), %d already converged ==" % (n_change, len(R.actions) - n_change))
     if not args.dry_run and n_change:
         print("   restart may be needed for subscription changes to take effect")
-    print("   client subscription (clash): https://<your-ip>:%s%s%s" %
-          (eff["subPort"], eff["subClashPath"], sub_id))
+    print("   client subscription (clash): %s://<your-ip>:%s%s%s" %
+          (scheme_for(eff, "subCertFile", "subKeyFile"), eff["subPort"], eff["subClashPath"], sub_id))
     return 0
 
 
